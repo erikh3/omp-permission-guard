@@ -28,6 +28,55 @@ const MODES: Record<string, true> = { off: true, heuristic: true, guardian: true
 const DEFAULT_MODE: Mode = "hybrid";
 const CONFIG_PATH = path.join(os.homedir(), ".omp", "agent", "permission-guard.json");
 
+/** Default confirm-dialog window: how long we wait for a human before denying. */
+const DEFAULT_CONFIRM_TIMEOUT_MS = 120_000;
+/**
+ * Head-room added on top of the confirm window when lifting the host handler
+ * budget. Covers the guardian model round-trip (which runs before the dialog,
+ * inside the same handler budget) plus dialog render/teardown, so the dialog's
+ * own timeout — not the host's kill-switch — is what fires first.
+ */
+const HOOK_TIMEOUT_MARGIN_MS = 30_000;
+
+/**
+ * Lift the extension host's per-handler timeout so a long confirm dialog isn't
+ * killed mid-prompt.
+ *
+ * The host caps every handler at `EXTENSION_HANDLER_TIMEOUT_MS` (30 s) and arms
+ * that timer when the handler is *invoked*, so the ceiling MUST be raised before
+ * the first `tool_call` — bumping it from inside a handler cannot rescue an
+ * already-armed timer. The only lever the host exposes is the module-level
+ * `testSetExtensionHandlerTimeoutMs` setter; it is a process-global mutation,
+ * applied once at load.
+ *
+ * Imported dynamically and defensively: the host package is an optional peer
+ * (absent in the test env), and the setter is an internal API that may vanish in
+ * a future release. On any failure the guard degrades to the host's 30 s default
+ * rather than crashing.
+ */
+async function raiseHostHandlerTimeout(
+	budgetMs: number,
+	logger?: { debug?: (...a: unknown[]) => void },
+): Promise<void> {
+	try {
+		// Dynamic import: `@oh-my-pi/pi-coding-agent` is an optional peer that is not
+		// installed in the test env, so a static import would fail module resolution
+		// at load. Inside omp the host is already loaded, so this resolves instantly.
+		const host = (await import("@oh-my-pi/pi-coding-agent")) as Record<string, unknown>;
+		const setter = host.testSetExtensionHandlerTimeoutMs;
+		if (typeof setter === "function") {
+			(setter as (ms: number) => void)(budgetMs);
+			logger?.debug?.("permission-guard: raised host handler timeout", { budgetMs });
+		} else {
+			logger?.debug?.(
+				"permission-guard: testSetExtensionHandlerTimeoutMs unavailable; confirm dialog capped at host default (30s)",
+			);
+		}
+	} catch (err) {
+		logger?.debug?.("permission-guard: could not raise host handler timeout", { error: String(err) });
+	}
+}
+
 interface GuardConfig {
 	mode?: Mode;
 	guardianModel?: string;
@@ -38,6 +87,14 @@ interface GuardConfig {
 	escalateBlocked?: boolean;
 	/** Surface a confirm dialog instead of a hard block when a UI exists (headless still hard-denies). Default true. */
 	promptOnBlock?: boolean;
+	/**
+	 * How long (ms) an interactive confirm dialog waits for a human before it
+	 * gives up and the call is denied. Default 120 000 (2 min). Because the
+	 * extension host caps every handler at 30 s, the guard lifts that ceiling to
+	 * cover this window (see `raiseHostHandlerTimeout`); otherwise the dialog is
+	 * killed mid-prompt with "Extension … timed out after 30000ms".
+	 */
+	confirmTimeoutMs?: number;
 }
 
 function isMode(value: unknown): value is Mode {
@@ -130,6 +187,14 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 
 	pi.setLabel("Permission Guard");
 
+	// Fix the confirm-dialog window at load and lift the host's per-handler ceiling
+	// to cover it. The host arms its 30 s kill-timer when the handler is invoked, so
+	// the budget must be raised now — before the first `tool_call` — and the dialog
+	// timeout must stay within it. Reading it once here keeps the two in lockstep;
+	// changing `confirmTimeoutMs` takes effect on the next session.
+	const confirmTimeoutMs = loadConfig(logger).confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS;
+	void raiseHostHandlerTimeout(confirmTimeoutMs + HOOK_TIMEOUT_MARGIN_MS, logger);
+
 	const resolveMode = (): Mode => {
 		if (sessionMode) return sessionMode;
 		const envMode = process.env.OMP_GUARD_MODE;
@@ -215,6 +280,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		const ok = await ctx.ui.confirm(
 			"Permission guard",
 			`${reason}\n\n${event.toolName}: ${previewArgs(event.toolName, event.input)}\n\nAllow this call?`,
+			{ timeout: confirmTimeoutMs },
 		);
 		if (!ok) return { block: true, reason: `[permission-guard] Denied by user: ${reason}` };
 	});

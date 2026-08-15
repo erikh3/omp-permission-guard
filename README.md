@@ -45,6 +45,7 @@ An **explicit user request wins**, without opening a prompt-injection hole:
   "maxAttempts": 3,
   "escalateBlocked": true,
   "promptOnBlock": true,
+  "confirmTimeoutMs": 120000,
   "approval": { "bash": "prompt" }
 }
 ```
@@ -54,6 +55,7 @@ An **explicit user request wins**, without opening a prompt-injection hole:
 - `maxAttempts` — guardian retry budget (default 3).
 - `escalateBlocked` — hybrid only: escalate a heuristic-blocked exec call to the guardian so it can allow an explicitly user-requested action (upgrade-only). Default `true`; set `false` for strict prove-or-block.
 - `promptOnBlock` — when a UI exists, surface a confirm dialog instead of a hard block so you can override; headless runs still hard-deny. Default `true`; set `false` for a hard wall even interactively.
+- `confirmTimeoutMs` — how long (ms) an interactive confirm dialog waits for you before it gives up and denies. Default `120000` (2 min). The guard lifts the host's 30 s per-handler ceiling to cover this window; read once at load, so a change takes effect on the next session.
 - `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks.
 
 Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches it for the current session.

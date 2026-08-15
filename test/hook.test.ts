@@ -117,4 +117,23 @@ describe("tool_call hook wiring", () => {
 		const res = await handler({ toolName: "bash", input: { command: "rm -rf /" } }, headless);
 		expect(res?.block).toBe(true);
 	});
+
+	test("prompt path passes a positive confirm timeout to the dialog", async () => {
+		process.env.OMP_GUARD_MODE = "guardian"; // exec-tier bash, no model -> prompt -> confirm
+		let seen: { timeout?: number } | undefined;
+		const spyCtx = {
+			...ctx,
+			ui: {
+				confirm: async (_t: string, _m: string, opts?: { timeout?: number }) => {
+					seen = opts;
+					return true;
+				},
+				notify: (m: string) => notes.push(m),
+			},
+		};
+		const { handler } = harness();
+		await handler({ toolName: "bash", input: { command: "echo $(date)" } }, spyCtx);
+		expect(typeof seen?.timeout).toBe("number");
+		expect(seen?.timeout).toBeGreaterThan(0);
+	});
 });
