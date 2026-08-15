@@ -28,53 +28,38 @@ const MODES: Record<string, true> = { off: true, heuristic: true, guardian: true
 const DEFAULT_MODE: Mode = "hybrid";
 const CONFIG_PATH = path.join(os.homedir(), ".omp", "agent", "permission-guard.json");
 
-/** Default confirm-dialog window: how long we wait for a human before denying. */
-const DEFAULT_CONFIRM_TIMEOUT_MS = 120_000;
 /**
- * Head-room added on top of the confirm window when lifting the host handler
- * budget. Covers the guardian model round-trip (which runs before the dialog,
- * inside the same handler budget) plus dialog render/teardown, so the dialog's
- * own timeout — not the host's kill-switch — is what fires first.
+ * The host's fixed per-handler budget (`EXTENSION_HANDLER_TIMEOUT_MS` in
+ * pi-coding-agent). The host arms this timer when the handler is invoked and
+ * kills it — surfacing "Extension … timed out after 30000ms" — if it hasn't
+ * returned by then. A plugin cannot raise it: the host's setter mutates a
+ * *different* lazily-evaluated module instance than the one that arms the timer
+ * (verified empirically), so the guard must finish heuristic + guardian + the
+ * confirm dialog within this window. Lifting the real ceiling needs an upstream
+ * omp change (a config key, or exempting interactive dialogs).
  */
-const HOOK_TIMEOUT_MARGIN_MS = 30_000;
+const HOST_HANDLER_BUDGET_MS = 30_000;
+/** Slack before the host budget so the dialog resolves and tears down cleanly
+ *  (a deny) rather than being killed mid-prompt. */
+const CONFIRM_SAFETY_MARGIN_MS = 2_000;
+/** Floor for the confirm window, even when the guardian ate most of the budget. */
+const MIN_CONFIRM_TIMEOUT_MS = 1_000;
+/**
+ * Default confirm-dialog window. Kept under the host budget because the dialog
+ * must resolve before the host's kill-timer fires; the effective value is always
+ * clamped by {@link confirmDialogTimeoutMs}.
+ */
+const DEFAULT_CONFIRM_TIMEOUT_MS = 20_000;
 
 /**
- * Lift the extension host's per-handler timeout so a long confirm dialog isn't
- * killed mid-prompt.
- *
- * The host caps every handler at `EXTENSION_HANDLER_TIMEOUT_MS` (30 s) and arms
- * that timer when the handler is *invoked*, so the ceiling MUST be raised before
- * the first `tool_call` — bumping it from inside a handler cannot rescue an
- * already-armed timer. The only lever the host exposes is the module-level
- * `testSetExtensionHandlerTimeoutMs` setter; it is a process-global mutation,
- * applied once at load.
- *
- * Imported dynamically and defensively: the host package is an optional peer
- * (absent in the test env), and the setter is an internal API that may vanish in
- * a future release. On any failure the guard degrades to the host's 30 s default
- * rather than crashing.
+ * Clamp the configured confirm window to what actually fits inside the host's
+ * fixed handler budget, given the time already spent in this handler (heuristic
+ * + guardian run before the prompt). Guarantees the dialog times out — a clean
+ * deny — before the host kills the handler with a "timed out" error.
  */
-async function raiseHostHandlerTimeout(
-	budgetMs: number,
-	logger?: { debug?: (...a: unknown[]) => void },
-): Promise<void> {
-	try {
-		// Dynamic import: `@oh-my-pi/pi-coding-agent` is an optional peer that is not
-		// installed in the test env, so a static import would fail module resolution
-		// at load. Inside omp the host is already loaded, so this resolves instantly.
-		const host = (await import("@oh-my-pi/pi-coding-agent")) as Record<string, unknown>;
-		const setter = host.testSetExtensionHandlerTimeoutMs;
-		if (typeof setter === "function") {
-			(setter as (ms: number) => void)(budgetMs);
-			logger?.debug?.("permission-guard: raised host handler timeout", { budgetMs });
-		} else {
-			logger?.debug?.(
-				"permission-guard: testSetExtensionHandlerTimeoutMs unavailable; confirm dialog capped at host default (30s)",
-			);
-		}
-	} catch (err) {
-		logger?.debug?.("permission-guard: could not raise host handler timeout", { error: String(err) });
-	}
+export function confirmDialogTimeoutMs(configuredMs: number, elapsedMs: number): number {
+	const remaining = HOST_HANDLER_BUDGET_MS - elapsedMs - CONFIRM_SAFETY_MARGIN_MS;
+	return Math.max(MIN_CONFIRM_TIMEOUT_MS, Math.min(configuredMs, remaining));
 }
 
 interface GuardConfig {
@@ -88,11 +73,11 @@ interface GuardConfig {
 	/** Surface a confirm dialog instead of a hard block when a UI exists (headless still hard-denies). Default true. */
 	promptOnBlock?: boolean;
 	/**
-	 * How long (ms) an interactive confirm dialog waits for a human before it
-	 * gives up and the call is denied. Default 120 000 (2 min). Because the
-	 * extension host caps every handler at 30 s, the guard lifts that ceiling to
-	 * cover this window (see `raiseHostHandlerTimeout`); otherwise the dialog is
-	 * killed mid-prompt with "Extension … timed out after 30000ms".
+	 * Upper bound (ms) on the interactive confirm dialog before it gives up and
+	 * denies. Default 20 000. The host caps every handler at 30 s and a plugin
+	 * cannot raise that, so this is clamped per call to fit the budget left after
+	 * the guardian runs (see {@link confirmDialogTimeoutMs}); values at or above
+	 * ~28 s gain nothing. Lower it for a snappier auto-deny.
 	 */
 	confirmTimeoutMs?: number;
 }
@@ -187,14 +172,6 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 
 	pi.setLabel("Permission Guard");
 
-	// Fix the confirm-dialog window at load and lift the host's per-handler ceiling
-	// to cover it. The host arms its 30 s kill-timer when the handler is invoked, so
-	// the budget must be raised now — before the first `tool_call` — and the dialog
-	// timeout must stay within it. Reading it once here keeps the two in lockstep;
-	// changing `confirmTimeoutMs` takes effect on the next session.
-	const confirmTimeoutMs = loadConfig(logger).confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS;
-	void raiseHostHandlerTimeout(confirmTimeoutMs + HOOK_TIMEOUT_MARGIN_MS, logger);
-
 	const resolveMode = (): Mode => {
 		if (sessionMode) return sessionMode;
 		const envMode = process.env.OMP_GUARD_MODE;
@@ -208,7 +185,12 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const arg = (Array.isArray(args) ? args.join(" ") : String(args ?? "")).trim().toLowerCase();
 			if (arg === "" || arg === "status") {
-				ctx.ui.notify(`Permission guard mode: ${resolveMode()} (config: ${CONFIG_PATH})`, "info");
+				const configured = loadConfig(logger).confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS;
+				const effective = confirmDialogTimeoutMs(configured, 0);
+				ctx.ui.notify(
+					`Permission guard mode: ${resolveMode()} | confirm dialog ${configured}ms (effective ≤ ${effective}ms), host handler cap ${HOST_HANDLER_BUDGET_MS}ms (config: ${CONFIG_PATH})`,
+					"info",
+				);
 				return;
 			}
 			if (!isMode(arg)) {
@@ -221,6 +203,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		// Stamp handler entry so the confirm dialog can be clamped to the host's
+		// remaining budget (heuristic + guardian eat into it before the prompt).
+		const startedAt = Date.now();
 		const mode = resolveMode();
 		if (mode === "off") return;
 
@@ -277,11 +262,24 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// prompt
 		const reason = action.reason ?? "This call could not be proven safe.";
 		if (!ctx.hasUI) return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
+		const configured = cfg.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS;
+		// A timed-out prompt MUST deny. In the interactive TUI the selector
+		// auto-selects its highlighted option on timeout — and confirm defaults to
+		// "Yes" — so without this an unattended prompt would auto-*allow*. `onTimeout`
+		// fires before that auto-select (and on the RPC path too), so we latch it and
+		// override the returned value.
+		let timedOut = false;
 		const ok = await ctx.ui.confirm(
 			"Permission guard",
 			`${reason}\n\n${event.toolName}: ${previewArgs(event.toolName, event.input)}\n\nAllow this call?`,
-			{ timeout: confirmTimeoutMs },
+			{
+				timeout: confirmDialogTimeoutMs(configured, Date.now() - startedAt),
+				onTimeout: () => {
+					timedOut = true;
+				},
+			},
 		);
+		if (timedOut) return { block: true, reason: `[permission-guard] Timed out waiting for confirmation: ${reason}` };
 		if (!ok) return { block: true, reason: `[permission-guard] Denied by user: ${reason}` };
 	});
 }

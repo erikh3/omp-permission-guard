@@ -7,7 +7,7 @@
  * config file.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import permissionGuard from "../src/index";
+import permissionGuard, { confirmDialogTimeoutMs } from "../src/index";
 
 type ToolCallResult = { block?: boolean; reason?: string } | undefined;
 type Handler = (event: { toolName: string; input: unknown }, ctx: unknown) => Promise<ToolCallResult>;
@@ -86,12 +86,15 @@ describe("tool_call hook wiring", () => {
 		expect(res?.block).toBe(true);
 	});
 
-	test("/guard status command runs", async () => {
+	test("/guard status shows mode and both timeouts", async () => {
 		const { commands } = harness();
 		expect(typeof commands.guard?.handler).toBe("function");
 		notes.length = 0;
 		await commands.guard!.handler("status", ctx);
-		expect(notes.some(n => n.includes("mode"))).toBe(true);
+		const status = notes.find(n => n.includes("mode"));
+		expect(status).toBeDefined();
+		expect(status).toContain("confirm dialog");
+		expect(status).toContain("host handler cap");
 	});
 
 	test("reads recent user intent from the session transcript", async () => {
@@ -118,7 +121,7 @@ describe("tool_call hook wiring", () => {
 		expect(res?.block).toBe(true);
 	});
 
-	test("prompt path passes a positive confirm timeout to the dialog", async () => {
+	test("prompt path clamps the confirm timeout within the host budget", async () => {
 		process.env.OMP_GUARD_MODE = "guardian"; // exec-tier bash, no model -> prompt -> confirm
 		let seen: { timeout?: number } | undefined;
 		const spyCtx = {
@@ -135,5 +138,46 @@ describe("tool_call hook wiring", () => {
 		await handler({ toolName: "bash", input: { command: "echo $(date)" } }, spyCtx);
 		expect(typeof seen?.timeout).toBe("number");
 		expect(seen?.timeout).toBeGreaterThan(0);
+		// Must never exceed the host's 30s handler budget (minus the 2s safety margin),
+		// or the host kills the handler before the dialog can resolve.
+		expect(seen?.timeout).toBeLessThanOrEqual(28_000);
+	});
+
+	test("confirm timeout forces deny even if the dialog auto-selects allow", async () => {
+		process.env.OMP_GUARD_MODE = "guardian"; // exec-tier bash, no model -> prompt -> confirm
+		// Mimic the interactive TUI: on timeout it fires onTimeout and then
+		// auto-selects the highlighted option ("Yes" -> true).
+		const timeoutCtx = {
+			...ctx,
+			ui: {
+				confirm: async (_t: string, _m: string, opts?: { onTimeout?: () => void }) => {
+					opts?.onTimeout?.();
+					return true;
+				},
+				notify: (m: string) => notes.push(m),
+			},
+		};
+		const { handler } = harness();
+		const res = await handler({ toolName: "bash", input: { command: "echo $(date)" } }, timeoutCtx);
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("Timed out");
+	});
+});
+
+describe("confirmDialogTimeoutMs clamp", () => {
+	test("returns the configured value when it fits the budget", () => {
+		expect(confirmDialogTimeoutMs(20_000, 0)).toBe(20_000);
+	});
+
+	test("clamps down to budget minus safety margin", () => {
+		expect(confirmDialogTimeoutMs(120_000, 0)).toBe(28_000);
+	});
+
+	test("subtracts time already spent in the handler", () => {
+		expect(confirmDialogTimeoutMs(120_000, 25_000)).toBe(3_000);
+	});
+
+	test("never drops below the floor even when the budget is exhausted", () => {
+		expect(confirmDialogTimeoutMs(120_000, 29_500)).toBe(1_000);
 	});
 });
