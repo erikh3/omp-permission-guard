@@ -176,14 +176,15 @@ async function askApproval(
 
 	const denyIndex = options.indexOf(denyLabel);
 	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends),
-	// so reconstruct the nav hints and append the judging model — the only edge
-	// slot the selector exposes. Omitted when no model actually judged (heuristic).
+	// so reconstruct the nav hints and append the judge model — the only edge slot
+	// the selector exposes. `opts.judge` is the model the guardian resolved for
+	// this call (present only in guardian/hybrid when a model was consulted).
 	const nav = "up/down navigate  enter select  esc cancel";
 	const picked = await ui.select(title, options, {
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
 		outline: true,
 		selectionMarker: "radio",
-		helpText: opts.judge ? `${nav}   ·   judged by ${opts.judge}` : undefined,
+		helpText: opts.judge ? `${nav}   ·   judge: ${opts.judge}` : undefined,
 	});
 	if (picked === "Allow once") return { decision: "allow" };
 	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
