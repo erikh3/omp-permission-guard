@@ -18,7 +18,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import { evaluatePermission, type GuardMode } from "./evaluate";
 import { GuardianJudge } from "./guardian";
 import { getToolTier } from "./tier";
@@ -124,9 +124,60 @@ function recentUserIntent(ctx: TranscriptCtx): string | undefined {
 	return joined.length > MAX_INTENT_CHARS ? joined.slice(joined.length - MAX_INTENT_CHARS) : joined;
 }
 
+type ApprovalDecision = "allow" | "allow-session" | "deny";
+
+/**
+ * Swap the streaming spinner + a status-bar chip to a clear "paused, waiting on
+ * you" state while an approval dialog is open, then restore them. Without this
+ * the host keeps showing the in-flight tool's own working message, so a blocked
+ * agent looks like it is still busy running the tool.
+ */
+async function withBlockedIndicator<T>(ui: ExtensionUIContext, toolName: string, run: () => Promise<T>): Promise<T> {
+	ui.setWorkingMessage?.(`Permission guard: waiting for you to approve ${toolName}`);
+	ui.setStatus?.("permission-guard", "paused - approval needed");
+	try {
+		return await run();
+	} finally {
+		ui.setStatus?.("permission-guard", undefined);
+		ui.setWorkingMessage?.();
+	}
+}
+
+/**
+ * Ask the user to approve a gated call. Prefers the rich ask dialog (labelled
+ * options + descriptions, the same surface the ask tool uses); falls back to a
+ * plain yes/no confirm on hosts without `askDialog`.
+ */
+async function askApproval(ui: ExtensionUIContext, reason: string, toolName: string, argsPreview: string): Promise<ApprovalDecision> {
+	const question = `${reason}\n\n${toolName}: ${argsPreview}`;
+	if (ui.askDialog) {
+		const res = await ui.askDialog([
+			{
+				id: "permission-guard",
+				header: "Permission guard",
+				question,
+				options: [
+					{ label: "Allow once", description: "Run this call now." },
+					{ label: "Allow this exact call this session", description: "Skip the prompt for an identical call until you restart or run /guard off." },
+					{ label: "Deny", description: "Block the call and tell the agent why it was refused." },
+				],
+				recommended: 0,
+			},
+		]);
+		if (!res || res.kind !== "submit") return "deny";
+		const picked = res.results[0]?.selectedOptions[0];
+		if (picked === "Allow once") return "allow";
+		if (picked?.startsWith("Allow this exact call")) return "allow-session";
+		return "deny";
+	}
+	const ok = await ui.confirm("Permission guard", `${question}\n\nAllow this call?`);
+	return ok ? "allow" : "deny";
+}
+
 export default function permissionGuard(pi: ExtensionAPI): void {
 	const logger = pi.logger;
 	let sessionMode: Mode | undefined;
+	const sessionAllow = new Set<string>();
 
 	pi.setLabel("Permission Guard");
 
@@ -168,6 +219,8 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 
 		const tier = getToolTier(event.toolName, event.input, tools);
 		if (tier === "read") return; // read-tier tools carry no write/exec risk
+		const callKey = `${event.toolName}:${JSON.stringify(event.input)}`;
+		if (sessionAllow.has(callKey)) return;
 
 		const cfg = loadConfig(logger);
 		const guardian =
@@ -212,14 +265,18 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// prompt
 		const reason = action.reason ?? "This call could not be proven safe.";
 		if (!ctx.hasUI) return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
-		// Wait indefinitely for the user's decision. The host pauses the 30s
-		// extension-handler budget while a tool_call dialog is open, so the prompt is
-		// never force-killed; it resolves only when the user answers or the turn is
-		// aborted (ESC / interrupt / shutdown), which cancels the dialog.
-		const ok = await ctx.ui.confirm(
-			"Permission guard",
-			`${reason}\n\n${event.toolName}: ${previewArgs(event.toolName, event.input)}\n\nAllow this call?`,
+		// The dialog blocks indefinitely: the host pauses the 30s handler budget
+		// while a tool_call dialog is open, so it resolves only when the user
+		// answers or the turn is aborted (ESC / interrupt / shutdown).
+		const decision = await withBlockedIndicator(ctx.ui, event.toolName, () =>
+			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input)),
 		);
-		if (!ok) return { block: true, reason: `[permission-guard] Denied by user: ${reason}` };
+		if (decision === "allow") return;
+		if (decision === "allow-session") {
+			sessionAllow.add(callKey);
+			ctx.ui.notify(`Permission guard: allowing this ${event.toolName} call for the rest of the session.`, "info");
+			return;
+		}
+		return { block: true, reason: `[permission-guard] Denied by user: ${reason}` };
 	});
 }
