@@ -164,20 +164,15 @@ async function askApproval(
 	if (opts.externalDir) options.push(`Allow the directory ${opts.externalDir} this session`);
 	options.push(denyLabel, "Deny (type your own)");
 
-	// The command is the primary thing to judge (bold + accent); the reason is
-	// secondary context (dim), separated by a blank line. `previewArgs` marks a
-	// clipped command with a trailing ellipsis — surface that as a muted
-	// "(truncated)" tag so it is obvious the call was shortened for display.
-	const theme = ui.theme;
+	// The host selector renders the title through its own highlighter (directory
+	// paths in the reason, shell syntax in the command), so we pass plain text and
+	// let it style consistently. Embedding our own ANSI here double-styles the
+	// text and the colors flip when a theme re-render (e.g. focus change) re-runs
+	// the highlighter over our codes. `previewArgs` clips a long command with a
+	// trailing ellipsis; surface that as an explicit "(truncated)" note instead.
 	const truncated = argsPreview.endsWith("…");
-	const command = `${toolName}: ${truncated ? argsPreview.slice(0, -1) : argsPreview}`;
-	let title: string;
-	if (theme) {
-		const tag = truncated ? `${theme.bold(theme.fg("accent", "..."))}${theme.fg("muted", "(truncated)")}` : "";
-		title = `${theme.fg("dim", reason)}\n\n${theme.bold(theme.fg("accent", command))}${tag}`;
-	} else {
-		title = `${reason}\n\n${command}${truncated ? "...(truncated)" : ""}`;
-	}
+	const shownArgs = truncated ? `${argsPreview.slice(0, -1)}...(truncated)` : argsPreview;
+	const title = `${reason}\n\n${toolName}: ${shownArgs}`;
 
 	const denyIndex = options.indexOf(denyLabel);
 	const picked = await ui.select(title, options, {
