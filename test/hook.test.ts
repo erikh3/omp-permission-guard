@@ -48,17 +48,17 @@ const ctx = {
 	},
 };
 
-/** A UI whose `select` picks the first option whose label includes `target`; `input` returns `inputText`. */
+/** A UI whose `select` picks the first option that includes `target`; `input` returns `inputText`. */
 function selectUi(
 	target: string,
-	opts: { inputText?: string; capture?: (options: Array<{ label: string }>, dialogOptions: Record<string, unknown> | undefined) => void } = {},
+	opts: { inputText?: string; capture?: (options: string[], dialogOptions: Record<string, unknown> | undefined) => void } = {},
 ) {
 	return {
 		notify: (m: string) => notes.push(m),
 		input: async () => opts.inputText,
-		select: async (_title: string, options: Array<{ label: string }>, dialogOptions?: Record<string, unknown>) => {
+		select: async (_title: string, options: string[], dialogOptions?: Record<string, unknown>) => {
 			opts.capture?.(options, dialogOptions);
-			return options.find(o => o.label.includes(target))?.label;
+			return options.find(o => o.includes(target));
 		},
 	};
 }
@@ -153,9 +153,9 @@ describe("tool_call hook wiring", () => {
 			ui: {
 				notify: (m: string) => notes.push(m),
 				input: async () => undefined,
-				select: async (_t: string, options: Array<{ label: string }>) => {
+				select: async (_t: string, options: string[]) => {
 					dialogCalls++;
-					return options.find(o => o.label.includes("Allow this exact call"))?.label;
+					return options.find(o => o.includes("Allow this exact call"));
 				},
 			},
 		};
@@ -177,13 +177,13 @@ describe("tool_call hook wiring", () => {
 
 	test("a guard-initiated prompt recommends Deny (pre-selected)", async () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
-		let options: Array<{ label: string }> = [];
+		let options: string[] = [];
 		let dialogOptions: Record<string, unknown> | undefined;
 		const capCtx = { ...ctx, ui: selectUi("Deny", { capture: (o, d) => { options = o; dialogOptions = d; } }) };
 		const { handler } = harness();
 		await handler({ toolName: "bash", input: { command: "rm -rf /" } }, capCtx);
-		const denyIndex = options.findIndex(o => o.label.startsWith("Deny") && !o.label.includes("type your own"));
-		expect(options[denyIndex]?.label).toContain("(recommended)");
+		const denyIndex = options.findIndex(o => o.startsWith("Deny") && !o.includes("type your own"));
+		expect(options[denyIndex]).toContain("(recommended)");
 		expect(dialogOptions?.initialIndex).toBe(denyIndex);
 	});
 
@@ -196,11 +196,11 @@ describe("tool_call hook wiring", () => {
 			ui: {
 				notify: (m: string) => notes.push(m),
 				input: async () => undefined,
-				select: async (_t: string, options: Array<{ label: string }>) => {
+				select: async (_t: string, options: string[]) => {
 					dialogCalls++;
-					const dir = options.find(o => o.label.startsWith("Allow the directory"));
+					const dir = options.find(o => o.startsWith("Allow the directory"));
 					if (dir) sawDirOption = true;
-					return dir?.label;
+					return dir;
 				},
 			},
 		};

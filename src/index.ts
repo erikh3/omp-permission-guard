@@ -160,21 +160,19 @@ async function askApproval(
 	opts: { recommendDeny: boolean; externalDir?: string },
 ): Promise<ApprovalOutcome> {
 	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
-	const options: { label: string; description: string }[] = [
-		{ label: "Allow once", description: "Run this call now." },
-		{ label: "Allow this exact call this session", description: "Skip the prompt for an identical call until you restart or run /guard off." },
-	];
-	if (opts.externalDir) {
-		options.push({
-			label: `Allow the directory ${opts.externalDir} this session`,
-			description: "Run calls under this directory without asking again this session.",
-		});
-	}
-	options.push({ label: denyLabel, description: "Block the call and tell the agent it was refused." });
-	options.push({ label: "Deny (type your own)", description: "Block the call and type a message the agent will see." });
+	const options: string[] = ["Allow once", "Allow this exact call this session"];
+	if (opts.externalDir) options.push(`Allow the directory ${opts.externalDir} this session`);
+	options.push(denyLabel, "Deny (type your own)");
 
-	const denyIndex = options.findIndex(o => o.label === denyLabel);
-	const picked = await ui.select(`${reason}\n${toolName}: ${argsPreview}`, options, {
+	// Dim the explanation and bold-accent the command so the actual call stands out.
+	const theme = ui.theme;
+	const command = `${toolName}: ${argsPreview}`;
+	const title = theme
+		? `${theme.fg("dim", reason)}\n${theme.bold(theme.fg("accent", command))}`
+		: `${reason}\n${command}`;
+
+	const denyIndex = options.indexOf(denyLabel);
+	const picked = await ui.select(title, options, {
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
 		outline: true,
 		selectionMarker: "radio",
