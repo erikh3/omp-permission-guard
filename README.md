@@ -66,6 +66,18 @@ Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`
 
 The dialog has no timeout: it waits until you choose (or abort the turn with ESC, which denies).
 
+## Debugging
+
+The guard emits a `[permission-guard]` debug log for every decision it makes, so you can trace exactly what was gated and why. Each line carries the tool name and an argument preview in the message, plus a structured payload:
+
+- **verdict** — `allow` or `deny` (the message begins with this).
+- **`tool`, `args`, `tier`, `mode`** — the call and how it was classified.
+- **`via`** — where the decision came from: `session-cache` (a prior "allow this call"), `classifier` (heuristic/guardian auto allow/deny), `headless` (no UI, hard deny), or `prompt` (you were asked).
+- **`choice`** — for a prompt, what you picked: `allow-once`, `allow-session`, `allow-dir` (with `dir`), `deny`, or `deny-custom` (with your `reason`).
+- **`reason`** — the classifier/guardian explanation or your typed message.
+
+Escalations to the Guardian judge log separately: `[permission-guard] escalate <tool>: <args>` (with `trigger: blocked | uncertain`) when the judge is invoked, and `[permission-guard] guardian verdict <decision> for <tool>` with its ruling. Grep your omp debug log for `[permission-guard]` to see the full decision trail.
+
 ## Install
 
 ### Marketplace (recommended)

@@ -202,6 +202,18 @@ export class GuardianJudge {
 	 */
 	async evaluate(req: GuardianRequest, signal?: AbortSignal): Promise<GuardianVerdict> {
 		const log = this.#deps.logger?.debug ?? (() => {});
+		let argsPreview: string;
+		try {
+			argsPreview = (JSON.stringify(req.args) ?? "undefined").slice(0, 500);
+		} catch {
+			argsPreview = "(unserializable)";
+		}
+		log(`[permission-guard] escalate ${req.toolName}: ${argsPreview}`, {
+			tool: req.toolName,
+			args: argsPreview,
+			trigger: req.blocked ? "blocked" : "uncertain",
+			reason: req.reason,
+		});
 		const completeSimple = await loadCompleteSimple();
 		if (!completeSimple) {
 			log("guardian: completeSimple unavailable");
@@ -247,7 +259,14 @@ export class GuardianJudge {
 					throw new Error(response.errorMessage ?? "guardian completion error");
 				}
 				const verdict = parseVerdict(response.content);
-				if (verdict) return verdict;
+				if (verdict) {
+					log(`[permission-guard] guardian verdict ${verdict.decision} for ${req.toolName}`, {
+						tool: req.toolName,
+						decision: verdict.decision,
+						reason: verdict.reason,
+					});
+					return verdict;
+				}
 				throw new Error("guardian returned no parseable verdict");
 			} catch (err) {
 				if (signal?.aborted) return { decision: "error" };

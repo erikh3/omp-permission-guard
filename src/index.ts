@@ -234,8 +234,21 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 
 		const tier = getToolTier(event.toolName, event.input, tools);
 		if (tier === "read") return; // read-tier tools carry no write/exec risk
+
+		const argsPreview = previewArgs(event.toolName, event.input);
+		const log = (verdict: string, extra?: Record<string, unknown>) =>
+			logger?.debug?.(`[permission-guard] ${verdict} ${event.toolName}: ${argsPreview}`, {
+				tool: event.toolName,
+				args: argsPreview,
+				tier,
+				mode,
+				...extra,
+			});
 		const callKey = `${event.toolName}:${JSON.stringify(event.input)}`;
-		if (sessionAllow.has(callKey)) return;
+		if (sessionAllow.has(callKey)) {
+			log("allow", { via: "session-cache" });
+			return;
+		}
 
 		const cfg = loadConfig(logger);
 		const guardian =
@@ -275,12 +288,21 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			allowedRoots: [...sessionAllowedRoots],
 		});
 
-		if (action.action === "allow") return;
-		if (action.action === "deny") return { block: true, reason: `[permission-guard] ${action.reason}` };
+		if (action.action === "allow") {
+			log("allow", { via: "classifier" });
+			return;
+		}
+		if (action.action === "deny") {
+			log("deny", { via: "classifier", reason: action.reason });
+			return { block: true, reason: `[permission-guard] ${action.reason}` };
+		}
 
 		// prompt
 		const reason = action.reason ?? "This call could not be proven safe.";
-		if (!ctx.hasUI) return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
+		if (!ctx.hasUI) {
+			log("deny", { via: "headless", reason });
+			return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
+		}
 		// The guard only prompts when it could not prove the call safe, so it leans
 		// Deny; a workspace-escape reason yields the directory we can offer to allow.
 		const externalDir = /outside the workspace root: (.+)$/.exec(reason)?.[1];
@@ -293,17 +315,23 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				externalDir,
 			}),
 		);
-		if (outcome.decision === "allow") return;
+		if (outcome.decision === "allow") {
+			log("allow", { via: "prompt", choice: "allow-once" });
+			return;
+		}
 		if (outcome.decision === "allow-session") {
 			sessionAllow.add(callKey);
+			log("allow", { via: "prompt", choice: "allow-session" });
 			ctx.ui.notify(`Permission guard: allowing this ${event.toolName} call for the rest of the session.`, "info");
 			return;
 		}
 		if (outcome.decision === "allow-dir" && externalDir) {
 			sessionAllowedRoots.add(externalDir);
+			log("allow", { via: "prompt", choice: "allow-dir", dir: externalDir });
 			ctx.ui.notify(`Permission guard: allowing the directory ${externalDir} for the rest of the session.`, "info");
 			return;
 		}
+		log("deny", { via: "prompt", choice: outcome.message ? "deny-custom" : "deny", reason: outcome.message ?? reason });
 		return { block: true, reason: `[permission-guard] Denied by user: ${outcome.message ?? reason}` };
 	});
 }

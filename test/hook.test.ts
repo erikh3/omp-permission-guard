@@ -16,7 +16,7 @@ function harness() {
 	let handler: Handler | undefined;
 	const commands: Record<string, { handler: (a: unknown, c: unknown) => Promise<void> }> = {};
 	const pi = {
-		logger: { debug: () => {} },
+		logger: { debug: (msg: string, data?: unknown) => logs.push({ msg, data }) },
 		setLabel: () => {},
 		registerCommand: (name: string, def: { handler: (a: unknown, c: unknown) => Promise<void> }) => {
 			commands[name] = def;
@@ -34,6 +34,7 @@ function harness() {
 }
 
 const notes: string[] = [];
+const logs: { msg: string; data?: unknown }[] = [];
 const ctx = {
 	cwd: process.cwd(),
 	hasUI: true,
@@ -65,6 +66,7 @@ function selectUi(
 
 afterEach(() => {
 	delete process.env.OMP_GUARD_MODE;
+	logs.length = 0;
 });
 
 describe("tool_call hook wiring", () => {
@@ -211,5 +213,38 @@ describe("tool_call hook wiring", () => {
 		// a later call in that now-allowed directory is not prompted again
 		expect(await handler({ toolName: "bash", input: { command: "cd /private/tmp && ls" } }, dirCtx)).toBeUndefined();
 		expect(dialogCalls).toBe(1);
+	});
+
+	test("logs an auto-deny with tool name and arguments", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const headless = { ...ctx, hasUI: false };
+		const { handler } = harness();
+		logs.length = 0;
+		await handler({ toolName: "bash", input: { command: "rm -rf /" } }, headless);
+		const entry = logs.find(l => l.msg.includes("deny"));
+		expect(entry).toBeDefined();
+		expect(entry!.msg).toContain("bash");
+		expect(entry!.msg).toContain("rm -rf /");
+		expect(entry!.data).toMatchObject({ tool: "bash", tier: "exec", mode: "heuristic", via: "classifier" });
+	});
+
+	test("logs the user's choice on an interactive prompt", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const okCtx = { ...ctx, ui: selectUi("Allow once") };
+		const { handler } = harness();
+		logs.length = 0;
+		await handler({ toolName: "bash", input: { command: "rm -rf /" } }, okCtx);
+		const entry = logs.find(l => l.msg.includes("allow"));
+		expect(entry?.data).toMatchObject({ via: "prompt", choice: "allow-once" });
+	});
+
+	test("logs a custom denial with the user's message", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const denyCtx = { ...ctx, ui: selectUi("Deny (type your own)", { inputText: "nope, use /sandbox" }) };
+		const { handler } = harness();
+		logs.length = 0;
+		await handler({ toolName: "bash", input: { command: "rm -rf /" } }, denyCtx);
+		const entry = logs.find(l => l.msg.includes("deny"));
+		expect(entry?.data).toMatchObject({ via: "prompt", choice: "deny-custom", reason: "nope, use /sandbox" });
 	});
 });
