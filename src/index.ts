@@ -224,16 +224,34 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			mode === "guardian" || mode === "hybrid"
 				? new GuardianJudge(
 						{
-							resolveModel: (): Model<Api> | undefined => {
+							resolveModels: (): readonly Model<Api>[] => {
 								const models = ctx.models;
-								if (!models) return undefined;
+								if (!models) return [];
+								const ordered: Model<Api>[] = [];
+								const seen = new Set<string>();
+								const push = (m: Model<Api> | undefined): void => {
+									if (!m) return;
+									const key = `${m.provider}/${m.id}`;
+									if (seen.has(key)) return;
+									seen.add(key);
+									ordered.push(m);
+								};
 								const spec = cfg.guardianModel?.trim();
-								return (
-									(spec ? models.resolve(spec) : undefined) ??
-									models.resolve("@smol") ??
-									models.resolve("@commit") ??
-									models.current()
+								if (spec) push(models.resolve(spec));
+								push(models.resolve("@smol"));
+								push(models.resolve("@commit"));
+								push(models.current());
+								// Last-resort fallback: every authenticated model, cheapest
+								// first. Guarantees a judge-usable model exists even when the
+								// configured model and all fast roles resolve to a provider
+								// whose API the guardian's isolated pi-ai can't map (e.g. an
+								// all-<extension-provider> session). evaluate() skips unmappable
+								// candidates cheaply, without a network call.
+								const byCostAsc = [...models.list()].sort(
+									(a, b) => (a.cost?.input ?? Number.POSITIVE_INFINITY) - (b.cost?.input ?? Number.POSITIVE_INFINITY),
 								);
+								for (const m of byCostAsc) push(m);
+								return ordered;
 							},
 							getApiKey: (model: Model<Api>) => ctx.modelRegistry.getApiKey(model),
 							logger,

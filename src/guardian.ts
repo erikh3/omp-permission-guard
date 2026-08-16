@@ -70,11 +70,23 @@ export interface GuardianRequest {
 
 /** Live dependencies injected from the extension handler context. */
 export interface GuardianDeps {
-	/** Resolve the model to judge with (configured guardian model, a fast role, or the session model). */
-	resolveModel: () => Model<Api> | undefined;
-	/** Look up the API key for the resolved model (usually `ctx.modelRegistry.getApiKey`). */
+	/**
+	 * Ordered candidate models to judge with, best first (configured guardian
+	 * model, fast roles, session model, then any authenticated model). {@link
+	 * GuardianJudge.evaluate} walks them, skipping any whose API the isolated
+	 * pi-ai can't stream, so a usable judge model is found even when the
+	 * preferred one belongs to an unmappable extension provider.
+	 */
+	resolveModels: () => readonly Model<Api>[];
+	/** Look up the API key for a candidate model (usually `ctx.modelRegistry.getApiKey`). */
 	getApiKey: (model: Model<Api>) => Promise<string | undefined>;
 	logger?: { debug?: (...args: unknown[]) => void };
+	/**
+	 * Completion function used to run the judge. Defaults to the pi-ai
+	 * `completeSimple` resolved lazily from the host install; injectable so tests
+	 * can drive candidate selection and retry behavior without a live model.
+	 */
+	completeSimple?: CompleteSimpleFn;
 }
 
 export interface GuardianOptions {
@@ -82,7 +94,7 @@ export interface GuardianOptions {
 	baseBackoffMs?: number;
 }
 
-type CompleteSimpleFn = (
+export type CompleteSimpleFn = (
 	model: Model<Api>,
 	context: { systemPrompt: string[]; messages: { role: string; content: string; timestamp: number }[]; tools: Tool[] },
 	options: Record<string, unknown>,
@@ -182,6 +194,18 @@ async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+/**
+ * True for the deterministic error pi-ai's `mapOptionsForApi` throws when a
+ * model's `api` is not dispatchable by *this* isolated pi-ai instance — e.g. an
+ * extension-registered provider whose custom-API registration lives in omp's
+ * bundled module instance, not the on-disk one we import here. Retrying the same
+ * model is pointless; the judge must move to a different candidate instead.
+ */
+function isUnmappableApiError(err: unknown): boolean {
+	const message = err instanceof Error ? err.message : String(err);
+	return message.includes("Unhandled API in mapOptionsForApi");
+}
+
 export class GuardianJudge {
 	readonly #deps: GuardianDeps;
 	readonly #options: GuardianOptions;
@@ -197,63 +221,91 @@ export class GuardianJudge {
 	}
 
 	/**
-	 * Review a proposed tool call. Retries transient failures with exponential
-	 * backoff, then returns `{ decision: "error" }` so the caller can fail safe.
+	 * Review a proposed tool call. Walks the candidate models in order: a model
+	 * whose API this pi-ai instance can't stream is skipped immediately (no retry,
+	 * no wasted budget); transient failures on a usable model retry with
+	 * exponential backoff. Returns `{ decision: "error" }` so the caller can fail
+	 * safe only when no candidate yields a verdict.
 	 */
 	async evaluate(req: GuardianRequest, signal?: AbortSignal): Promise<GuardianVerdict> {
 		const log = this.#deps.logger?.debug ?? (() => {});
-		const completeSimple = await loadCompleteSimple();
+		const completeSimple = this.#deps.completeSimple ?? (await loadCompleteSimple());
 		if (!completeSimple) {
 			log("guardian: completeSimple unavailable");
 			return { decision: "error" };
 		}
-		const model = this.#deps.resolveModel();
-		if (!model) {
+		const candidates = this.#deps.resolveModels();
+		if (candidates.length === 0) {
 			log("guardian: no model available");
-			return { decision: "error" };
-		}
-		const apiKey = await this.#deps.getApiKey(model);
-		if (!apiKey) {
-			log("guardian: no API key", { provider: model.provider, id: model.id });
 			return { decision: "error" };
 		}
 
 		const userMessage = buildUserMessage(req);
-		const maxTokens = model.reasoning
-			? Math.max(GUARDIAN_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS)
-			: GUARDIAN_MAX_TOKENS;
 		const maxAttempts = this.#maxAttempts();
 		const baseBackoff = this.#options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
 
-		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+		for (const model of candidates) {
 			if (signal?.aborted) return { decision: "error" };
-			try {
-				const response = await completeSimple(
-					model,
-					{
-						systemPrompt: [GUARDIAN_SYSTEM_PROMPT],
-						messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
-						tools: [verdictTool],
-					},
-					{
-						apiKey,
-						maxTokens,
-						disableReasoning: true,
-						toolChoice: { type: "tool", name: VERDICT_TOOL_NAME },
-						signal,
-					},
-				);
-				if (response.stopReason === "error") {
-					throw new Error(response.errorMessage ?? "guardian completion error");
-				}
-				const verdict = parseVerdict(response.content);
-				if (verdict) return verdict;
-				throw new Error("guardian returned no parseable verdict");
-			} catch (err) {
-				if (signal?.aborted) return { decision: "error" };
-				log("guardian: attempt failed", { attempt, error: err instanceof Error ? err.message : String(err) });
-				if (attempt < maxAttempts - 1) await abortableDelay(baseBackoff * 2 ** attempt, signal);
+			const apiKey = await this.#deps.getApiKey(model);
+			if (!apiKey) {
+				log("guardian: no API key", { provider: model.provider, id: model.id });
+				continue; // try the next candidate
 			}
+			const maxTokens = model.reasoning
+				? Math.max(GUARDIAN_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS)
+				: GUARDIAN_MAX_TOKENS;
+
+			let unmappable = false;
+			for (let attempt = 0; attempt < maxAttempts; attempt++) {
+				if (signal?.aborted) return { decision: "error" };
+				try {
+					const response = await completeSimple(
+						model,
+						{
+							systemPrompt: [GUARDIAN_SYSTEM_PROMPT],
+							messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
+							tools: [verdictTool],
+						},
+						{
+							apiKey,
+							maxTokens,
+							disableReasoning: true,
+							toolChoice: { type: "tool", name: VERDICT_TOOL_NAME },
+							signal,
+						},
+					);
+					if (response.stopReason === "error") {
+						throw new Error(response.errorMessage ?? "guardian completion error");
+					}
+					const verdict = parseVerdict(response.content);
+					if (verdict) return verdict;
+					throw new Error("guardian returned no parseable verdict");
+				} catch (err) {
+					if (signal?.aborted) return { decision: "error" };
+					if (isUnmappableApiError(err)) {
+						// Deterministic: this pi-ai instance can't dispatch the model's
+						// API. Skip to the next candidate instead of burning retries.
+						log("guardian: model API not streamable here, trying next candidate", {
+							provider: model.provider,
+							id: model.id,
+							api: model.api,
+						});
+						unmappable = true;
+						break;
+					}
+					log("guardian: attempt failed", {
+						attempt,
+						provider: model.provider,
+						id: model.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					if (attempt < maxAttempts - 1) await abortableDelay(baseBackoff * 2 ** attempt, signal);
+				}
+			}
+			// A usable (mappable) model that still exhausted its retry budget is a
+			// transient/persistent failure on a viable judge; cascading to more
+			// models risks blowing the host handler budget, so fail safe here.
+			if (!unmappable) break;
 		}
 		return { decision: "error" };
 	}
