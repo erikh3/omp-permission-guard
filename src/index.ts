@@ -157,7 +157,7 @@ async function askApproval(
 	reason: string,
 	toolName: string,
 	argsPreview: string,
-	opts: { recommendDeny: boolean; externalDir?: string },
+	opts: { recommendDeny: boolean; externalDir?: string; judge?: string },
 ): Promise<ApprovalOutcome> {
 	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
 	const options: string[] = ["Allow once", "Allow this exact call this session"];
@@ -175,10 +175,15 @@ async function askApproval(
 	const title = `${reason}\n\n${toolName}: ${shownArgs}`;
 
 	const denyIndex = options.indexOf(denyLabel);
+	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends),
+	// so reconstruct the nav hints and append the judging model — the only edge
+	// slot the selector exposes. Omitted when no model actually judged (heuristic).
+	const nav = "up/down navigate  enter select  esc cancel";
 	const picked = await ui.select(title, options, {
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
 		outline: true,
 		selectionMarker: "radio",
+		helpText: opts.judge ? `${nav}   ·   judged by ${opts.judge}` : undefined,
 	});
 	if (picked === "Allow once") return { decision: "allow" };
 	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
@@ -254,6 +259,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		}
 
 		const cfg = loadConfig(logger);
+		let judgeModel: Model<Api> | undefined;
 		const guardian =
 			mode === "guardian" || mode === "hybrid"
 				? new GuardianJudge(
@@ -262,12 +268,12 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 								const models = ctx.models;
 								if (!models) return undefined;
 								const spec = cfg.guardianModel?.trim();
-								return (
+								judgeModel =
 									(spec ? models.resolve(spec) : undefined) ??
 									models.resolve("@smol") ??
 									models.resolve("@commit") ??
-									models.current()
-								);
+									models.current();
+								return judgeModel;
 							},
 							getApiKey: (model: Model<Api>) => ctx.modelRegistry.getApiKey(model),
 							logger,
@@ -316,6 +322,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), {
 				recommendDeny: action.recommend === "deny",
 				externalDir,
+				judge: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
 			}),
 		);
 		if (outcome.decision === "allow") {
