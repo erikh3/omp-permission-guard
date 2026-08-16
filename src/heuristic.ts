@@ -361,6 +361,9 @@ function proveBashSafe(
 export function classifyHeuristic(toolName: string, args: unknown, ctx: HeuristicContext): HeuristicVerdict {
 	const record = asRecord(args);
 	switch (toolName) {
+		case "todo":
+			// Session-local task tracker: no filesystem or exec effect, always safe.
+			return ALLOW;
 		case "bash": {
 			const command = typeof record.command === "string" ? record.command : "";
 			const rawCwd = typeof record.cwd === "string" && record.cwd.length > 0 ? record.cwd : undefined;

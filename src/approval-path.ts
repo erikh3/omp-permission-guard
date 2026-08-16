@@ -1,6 +1,6 @@
 /**
  * Extract the target file path from `edit`-tool arguments across all edit
- * modes (hashline `¶PATH#…` header, apply-patch `*** Update File:` header, or a
+ * modes (bracket `[PATH#TAG]` header, legacy `¶PATH#…`/apply-patch headers, or a
  * plain `path` field). Returns `"(unknown)"` when no path can be determined.
  *
  * This is a pure, dependency-free helper shared by the edit tool's own approval
@@ -11,6 +11,9 @@ export function extractApprovalPath(args: unknown): string {
 	const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
 	const input = typeof record.input === "string" ? record.input : undefined;
 	if (input) {
+		const bracketMatch = /^\[([^#\]]+)#[^\]]*\]/m.exec(input);
+		if (bracketMatch?.[1]) return bracketMatch[1].trim();
+
 		const hashlineMatch = /^(?:¶|§|@)([^\s#]+)/m.exec(input);
 		if (hashlineMatch?.[1]) return hashlineMatch[1];
 
@@ -23,9 +26,10 @@ export function extractApprovalPath(args: unknown): string {
 }
 
 /**
- * Extract EVERY target path from `edit`-tool arguments: all hashline `¶PATH#…`
- * headers, all apply-patch `*** Add/Update/Delete File:` sections, all
- * `*** Move to:` rename destinations, and the plain `path` field (deduped).
+ * Extract EVERY target path from `edit`-tool arguments: all `[PATH#TAG]` and
+ * legacy `¶PATH#…` headers, all apply-patch `*** Add/Update/Delete File:`
+ * sections, all `*** Move to:` / `MV` rename destinations, and the plain `path`
+ * field (deduped).
  *
  * `extractApprovalPath` returns only the first path — enough for the approval
  * *prompt* label, but unsafe for a security check: a patch can touch many files
@@ -44,9 +48,15 @@ export function extractAllApprovalPaths(args: unknown): string[] {
 				if (p) paths.add(p);
 			}
 		};
+		add(/^\[([^#\]]+)#[^\]]*\]/gm); // [PATH#TAG] section header
 		add(/^(?:¶|§|@)([^\s#]+)/gm);
 		add(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm);
 		add(/^\*\*\* Move to:\s*(.+)$/gm);
+		// `MV DEST` rename destination is a write target; strip surrounding quotes.
+		for (const m of input.matchAll(/^MV\s+(.+?)\s*$/gm)) {
+			const dest = m[1]?.replace(/^["']|["']$/g, "").trim();
+			if (dest) paths.add(dest);
+		}
 	}
 
 	const targetPath = record.path;

@@ -59,6 +59,21 @@ describe("classifyHeuristic (other tools)", () => {
 			classifyHeuristic("write", { path: "~/.ssh/authorized_keys" }, { workspaceRoot: WS, tier: "write" }).decision,
 		).toBe("deny");
 	});
+	test("todo tool -> always allow (even at exec tier)", () => {
+		expect(classifyHeuristic("todo", { items: ["x"] }, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
+	});
+	test("edit with [PATH#TAG] header inside workspace -> allow", () => {
+		const input = "[src/stream.ts#864C]\nPUT >1:\n+const x = 1;";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("allow");
+	});
+	test("edit with [PATH#TAG] header outside workspace -> deny", () => {
+		const input = "[/etc/passwd#864C]\nPUT >1:\n+x";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
+	});
+	test("edit MV rename escaping the workspace -> deny", () => {
+		const input = "[src/a.ts#864C]\nMV ../../../../../../etc/evil.ts";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
+	});
 });
 
 describe("getToolTier", () => {
