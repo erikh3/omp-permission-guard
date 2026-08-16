@@ -15,7 +15,7 @@ export type GuardMode = "heuristic" | "guardian" | "hybrid";
 export type PermissionAction =
 	| { action: "allow" }
 	| { action: "deny"; reason: string }
-	| { action: "prompt"; reason?: string };
+	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny" };
 
 /** Minimal guardian surface the orchestrator needs. */
 export interface Guardian {
@@ -53,7 +53,7 @@ export interface EvaluatePermissionInput {
 const EXEC_TIER: ToolTier = "exec";
 
 function failSafe(hasUI: boolean, reason?: string): PermissionAction {
-	if (hasUI) return reason ? { action: "prompt", reason } : { action: "prompt" };
+	if (hasUI) return reason ? { action: "prompt", reason, recommend: "deny" } : { action: "prompt", recommend: "deny" };
 	return {
 		action: "deny",
 		reason: reason ? `Guardian unavailable: ${reason}` : "Guardian unavailable; denying to fail safe.",
@@ -101,7 +101,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 	// can override; headless — or strict — it is a hard deny. User-policy denies above are
 	// absolute and never routed through here.
 	const block = (reason: string): PermissionAction =>
-		hasUI && promptOnBlock ? { action: "prompt", reason } : { action: "deny", reason };
+		hasUI && promptOnBlock ? { action: "prompt", reason, recommend: "deny" } : { action: "deny", reason };
 
 	const runGuardian = async (opts: { reason?: string; blocked?: boolean }): Promise<PermissionAction> => {
 		if (!guardian) return failSafe(hasUI, opts.reason);

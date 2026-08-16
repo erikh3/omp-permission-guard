@@ -120,13 +120,13 @@ describe("tool_call hook wiring", () => {
 		expect(res?.block).toBe(true);
 	});
 
-	test("prompt path waits indefinitely (no timeout passed to confirm)", async () => {
+	test("prompt path passes no timeout to confirm (waits indefinitely)", async () => {
 		process.env.OMP_GUARD_MODE = "guardian"; // exec-tier bash, no model -> prompt -> confirm
-		let seen: unknown = "unset";
+		let seen: Record<string, unknown> | undefined;
 		const spyCtx = {
 			...ctx,
 			ui: {
-				confirm: async (_t: string, _m: string, opts?: unknown) => {
+				confirm: async (_t: string, _m: string, opts?: Record<string, unknown>) => {
 					seen = opts;
 					return true;
 				},
@@ -135,9 +135,63 @@ describe("tool_call hook wiring", () => {
 		};
 		const { handler } = harness();
 		const res = await handler({ toolName: "bash", input: { command: "echo $(date)" } }, spyCtx);
-		// No dialog options => no timeout => the dialog blocks until the user answers.
-		expect(seen).toBeUndefined();
-		// confirm=true (user allowed) -> tool runs
-		expect(res).toBeUndefined();
+		expect(seen?.timeout).toBeUndefined(); // no timeout => the dialog blocks until the user answers
+		expect(res).toBeUndefined(); // confirm=true (user allowed) -> tool runs
+	});
+
+	test("'allow this exact call this session' short-circuits identical later calls", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let dialogCalls = 0;
+		const sessionCtx = {
+			...ctx,
+			ui: {
+				confirm: async () => false,
+				notify: (m: string) => notes.push(m),
+				askDialog: async () => {
+					dialogCalls++;
+					return { kind: "submit", results: [{ selectedOptions: ["Allow this exact call this session"] }] };
+				},
+			},
+		};
+		const { handler } = harness();
+		const call = { toolName: "bash", input: { command: "rm -rf /" } };
+		expect(await handler(call, sessionCtx)).toBeUndefined(); // user allows for the session
+		expect(await handler(call, sessionCtx)).toBeUndefined(); // identical call auto-allowed
+		expect(dialogCalls).toBe(1); // prompted only once
+	});
+
+	test("deny with custom input forwards the user's own message to the agent", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const denyCtx = {
+			...ctx,
+			ui: {
+				confirm: async () => false,
+				notify: (m: string) => notes.push(m),
+				askDialog: async () => ({ kind: "submit", results: [{ selectedOptions: [], customInput: "use the sandbox path instead" }] }),
+			},
+		};
+		const { handler } = harness();
+		const res = await handler({ toolName: "bash", input: { command: "rm -rf /" } }, denyCtx);
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("use the sandbox path instead");
+	});
+
+	test("a guard-initiated prompt recommends Deny", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let recommended: number | undefined;
+		const capCtx = {
+			...ctx,
+			ui: {
+				confirm: async () => false,
+				notify: (m: string) => notes.push(m),
+				askDialog: async (questions: Array<{ recommended?: number }>) => {
+					recommended = questions[0]?.recommended;
+					return { kind: "submit", results: [{ selectedOptions: ["Deny"] }] };
+				},
+			},
+		};
+		const { handler } = harness();
+		await handler({ toolName: "bash", input: { command: "rm -rf /" } }, capCtx);
+		expect(recommended).toBe(2); // Deny option index
 	});
 });

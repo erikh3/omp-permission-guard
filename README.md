@@ -56,7 +56,7 @@ An **explicit user request wins**, without opening a prompt-injection hole:
 - `promptOnBlock` — when a UI exists, surface a confirm dialog instead of a hard block so you can override; headless runs still hard-deny. Default `true`; set `false` for a hard wall even interactively.
 - `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks.
 
-Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session. When a call needs confirmation, the guard pauses the agent (the spinner and status bar switch to "approval needed") and shows a dialog with three choices — **Allow once**, **Allow this exact call this session** (skips the prompt for an identical call until you restart or `/guard off`), and **Deny**. The dialog has no timeout: it waits until you choose (or abort the turn with ESC, which denies).
+Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session. When a call needs confirmation, the guard pauses the agent (the streaming spinner switches to "waiting for you to approve …") and shows a dialog with three choices — **Allow once**, **Allow this exact call this session** (skips the prompt for an identical call until you restart or `/guard off`), and **Deny**. The guard only prompts when it could not prove the call safe, so **Deny is pre-selected**; pick **Other** to deny with a message in your own words that is passed to the agent. The dialog has no timeout: it waits until you choose (or abort the turn with ESC, which denies).
 
 ## Install
 

@@ -124,21 +124,23 @@ function recentUserIntent(ctx: TranscriptCtx): string | undefined {
 	return joined.length > MAX_INTENT_CHARS ? joined.slice(joined.length - MAX_INTENT_CHARS) : joined;
 }
 
-type ApprovalDecision = "allow" | "allow-session" | "deny";
+interface ApprovalOutcome {
+	decision: "allow" | "allow-session" | "deny";
+	/** For a deny: custom text the user typed ("Other") or attached ("note"), forwarded to the agent. */
+	message?: string;
+}
 
 /**
- * Swap the streaming spinner + a status-bar chip to a clear "paused, waiting on
- * you" state while an approval dialog is open, then restore them. Without this
- * the host keeps showing the in-flight tool's own working message, so a blocked
- * agent looks like it is still busy running the tool.
+ * Swap the streaming spinner to a clear "paused, waiting on you" message while
+ * an approval dialog is open, then restore it. Without this the host keeps
+ * showing the in-flight tool's own working message, so a blocked agent looks
+ * like it is still busy running the tool.
  */
 async function withBlockedIndicator<T>(ui: ExtensionUIContext, toolName: string, run: () => Promise<T>): Promise<T> {
 	ui.setWorkingMessage?.(`Permission guard: waiting for you to approve ${toolName}`);
-	ui.setStatus?.("permission-guard", "paused - approval needed");
 	try {
 		return await run();
 	} finally {
-		ui.setStatus?.("permission-guard", undefined);
 		ui.setWorkingMessage?.();
 	}
 }
@@ -146,10 +148,19 @@ async function withBlockedIndicator<T>(ui: ExtensionUIContext, toolName: string,
 /**
  * Ask the user to approve a gated call. Prefers the rich ask dialog (labelled
  * options + descriptions, the same surface the ask tool uses); falls back to a
- * plain yes/no confirm on hosts without `askDialog`.
+ * plain yes/no confirm on hosts without `askDialog`. `recommended` marks the
+ * option the guard leans toward (Deny when it could not prove the call safe).
+ * A denial carries any custom text the user typed ("Other") or attached
+ * ("note") so their own words reach the agent instead of a generic refusal.
  */
-async function askApproval(ui: ExtensionUIContext, reason: string, toolName: string, argsPreview: string): Promise<ApprovalDecision> {
-	const question = `${reason}\n\n${toolName}: ${argsPreview}`;
+async function askApproval(
+	ui: ExtensionUIContext,
+	reason: string,
+	toolName: string,
+	argsPreview: string,
+	recommended: number,
+): Promise<ApprovalOutcome> {
+	const question = `${reason}\n${toolName}: ${argsPreview}`;
 	if (ui.askDialog) {
 		const res = await ui.askDialog([
 			{
@@ -159,19 +170,27 @@ async function askApproval(ui: ExtensionUIContext, reason: string, toolName: str
 				options: [
 					{ label: "Allow once", description: "Run this call now." },
 					{ label: "Allow this exact call this session", description: "Skip the prompt for an identical call until you restart or run /guard off." },
-					{ label: "Deny", description: "Block the call and tell the agent why it was refused." },
+					{ label: "Deny", description: 'Block the call; pick "Other" to tell the agent why in your own words.' },
 				],
-				recommended: 0,
+				recommended,
 			},
 		]);
-		if (!res || res.kind !== "submit") return "deny";
-		const picked = res.results[0]?.selectedOptions[0];
-		if (picked === "Allow once") return "allow";
-		if (picked?.startsWith("Allow this exact call")) return "allow-session";
-		return "deny";
+		if (!res || res.kind !== "submit") return { decision: "deny" };
+		const item = res.results[0];
+		const picked = item?.selectedOptions[0];
+		if (picked === "Allow once") return { decision: "allow" };
+		if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
+		// "Deny", "Other (type your own)", or a bare note -> deny, forwarding the
+		// user's own words to the agent when they supplied any.
+		const custom = item?.customInput?.trim();
+		const note = item?.note?.trim();
+		const message = [custom, note].filter(Boolean).join(" - ") || undefined;
+		return { decision: "deny", message };
 	}
-	const ok = await ui.confirm("Permission guard", `${question}\n\nAllow this call?`);
-	return ok ? "allow" : "deny";
+	const ok = await ui.confirm("Permission guard", `${question}\n\nAllow this call?`, {
+		initialIndex: recommended === 2 ? 1 : 0,
+	});
+	return { decision: ok ? "allow" : "deny" };
 }
 
 export default function permissionGuard(pi: ExtensionAPI): void {
@@ -265,18 +284,21 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// prompt
 		const reason = action.reason ?? "This call could not be proven safe.";
 		if (!ctx.hasUI) return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
+		// The guard only prompts when it could not prove the call safe, so it
+		// recommends Deny (option index 2) unless the lean is neutral.
+		const recommended = action.recommend === "deny" ? 2 : 0;
 		// The dialog blocks indefinitely: the host pauses the 30s handler budget
 		// while a tool_call dialog is open, so it resolves only when the user
 		// answers or the turn is aborted (ESC / interrupt / shutdown).
-		const decision = await withBlockedIndicator(ctx.ui, event.toolName, () =>
-			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input)),
+		const outcome = await withBlockedIndicator(ctx.ui, event.toolName, () =>
+			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), recommended),
 		);
-		if (decision === "allow") return;
-		if (decision === "allow-session") {
+		if (outcome.decision === "allow") return;
+		if (outcome.decision === "allow-session") {
 			sessionAllow.add(callKey);
 			ctx.ui.notify(`Permission guard: allowing this ${event.toolName} call for the rest of the session.`, "info");
 			return;
 		}
-		return { block: true, reason: `[permission-guard] Denied by user: ${reason}` };
+		return { block: true, reason: `[permission-guard] Denied by user: ${outcome.message ?? reason}` };
 	});
 }
