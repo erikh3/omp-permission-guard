@@ -66,6 +66,8 @@ Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`
 
 The dialog has no timeout: it waits until you choose (or abort the turn with ESC, which denies).
 
+The "this session" choices (allow this exact call, allow the directory) are held in memory for the running session only — they are never written to `permission-guard.json` and are cleared on restart. For a persistent rule, add an `approval` entry (e.g. `"bash": "allow"`) to the config file instead.
+
 ## Debugging
 
 The guard emits a `[permission-guard]` debug log for every decision it makes, so you can trace exactly what was gated and why. Each line carries the tool name and an argument preview in the message, plus a structured payload:
