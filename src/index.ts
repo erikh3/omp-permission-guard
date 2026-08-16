@@ -177,8 +177,9 @@ async function askApproval(
 	const denyIndex = options.indexOf(denyLabel);
 	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends),
 	// so reconstruct the nav hints and append the judge model — the only edge slot
-	// the selector exposes. `opts.judge` is the model the guardian resolved for
-	// this call (present only in guardian/hybrid when a model was consulted).
+	// the selector exposes. `opts.judge` is set only when the guardian model
+	// produced the ruling behind this prompt (a guardian deny), not on a heuristic
+	// block, a fail-safe, or an escalation the model declined.
 	const nav = "up/down navigate  enter select  esc cancel";
 	const picked = await ui.select(title, options, {
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
@@ -323,7 +324,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), {
 				recommendDeny: action.recommend === "deny",
 				externalDir,
-				judge: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
+				judge: action.judged && judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
 			}),
 		);
 		if (outcome.decision === "allow") {

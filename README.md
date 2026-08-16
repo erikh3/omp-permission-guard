@@ -64,7 +64,7 @@ Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`
 - **Deny** — block and tell the agent it was refused. The guard only prompts when it could not prove the call safe, so Deny is **pre-selected**.
 - **Deny (type your own)** — block and type a message that is forwarded to the agent verbatim.
 
-The dialog has no timeout: it waits until you choose (or abort the turn with ESC, which denies). When the Guardian is consulted (guardian/hybrid modes), the selector footer names the judge model — e.g. `… · judge: sap-aicore/anthropic--claude-4.5-haiku`.
+The dialog has no timeout: it waits until you choose (or abort the turn with ESC, which denies). When the Guardian model produced the ruling behind a prompt (a guardian **deny** in guardian/hybrid mode), the selector footer names it — e.g. `… · judge: sap-aicore/anthropic--claude-4.5-haiku`. Heuristic blocks, fail-safes, and escalations the model declined show no judge (the model did not rule).
 
 The "this session" choices (allow this exact call, allow the directory) are held in memory for the running session only — they are never written to `permission-guard.json` and are cleared on restart. For a persistent rule, add an `approval` entry (e.g. `"bash": "allow"`) to the config file instead.
 

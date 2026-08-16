@@ -280,4 +280,16 @@ describe("evaluatePermission (promptOnBlock human override)", () => {
 		});
 		expect(a.action).toBe("deny");
 	});
+	test("guardian-mode deny surfaces a judged prompt (model produced the ruling)", async () => {
+		const a = await evaluatePermission({ ...CRIT, mode: "guardian", guardian: denyGuardian, promptOnBlock: true, ...base });
+		expect(a.action === "prompt" && a.judged === true).toBe(true);
+	});
+	test("heuristic deny prompt is NOT judged (no model ruled)", async () => {
+		const a = await evaluatePermission({ ...CRIT, mode: "heuristic", promptOnBlock: true, ...base });
+		expect(a.action === "prompt" && !a.judged).toBe(true);
+	});
+	test("hybrid escalation-decline prompt is NOT judged (heuristic block stands)", async () => {
+		const a = await evaluatePermission({ ...CRIT, mode: "hybrid", guardian: denyGuardian, escalateBlocked: true, promptOnBlock: true, ...base });
+		expect(a.action === "prompt" && !a.judged).toBe(true);
+	});
 });
