@@ -247,4 +247,25 @@ describe("tool_call hook wiring", () => {
 		const entry = logs.find(l => l.msg.includes("deny"));
 		expect(entry?.data).toMatchObject({ via: "prompt", choice: "deny-custom", reason: "nope, use /sandbox" });
 	});
+
+	test("truncated command title has a blank line and a (truncated) marker", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let title = "";
+		const capCtx = {
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async (t: string) => {
+					title = t;
+					return "Deny";
+				},
+			},
+		};
+		const { handler } = harness();
+		const longCmd = `echo $(${"x".repeat(400)})`; // command substitution -> prompt; >300 chars -> truncated
+		await handler({ toolName: "bash", input: { command: longCmd } }, capCtx);
+		expect(title).toContain("\n\n"); // blank line between reason and command
+		expect(title).toContain("...(truncated)");
+	});
 });

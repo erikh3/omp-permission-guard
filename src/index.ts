@@ -164,12 +164,20 @@ async function askApproval(
 	if (opts.externalDir) options.push(`Allow the directory ${opts.externalDir} this session`);
 	options.push(denyLabel, "Deny (type your own)");
 
-	// Dim the explanation and bold-accent the command so the actual call stands out.
+	// The command is the primary thing to judge (bold + accent); the reason is
+	// secondary context (dim), separated by a blank line. `previewArgs` marks a
+	// clipped command with a trailing ellipsis — surface that as a muted
+	// "(truncated)" tag so it is obvious the call was shortened for display.
 	const theme = ui.theme;
-	const command = `${toolName}: ${argsPreview}`;
-	const title = theme
-		? `${theme.fg("dim", reason)}\n${theme.bold(theme.fg("accent", command))}`
-		: `${reason}\n${command}`;
+	const truncated = argsPreview.endsWith("…");
+	const command = `${toolName}: ${truncated ? argsPreview.slice(0, -1) : argsPreview}`;
+	let title: string;
+	if (theme) {
+		const tag = truncated ? `${theme.bold(theme.fg("accent", "..."))}${theme.fg("muted", "(truncated)")}` : "";
+		title = `${theme.fg("dim", reason)}\n\n${theme.bold(theme.fg("accent", command))}${tag}`;
+	} else {
+		title = `${reason}\n\n${command}${truncated ? "...(truncated)" : ""}`;
+	}
 
 	const denyIndex = options.indexOf(denyLabel);
 	const picked = await ui.select(title, options, {
