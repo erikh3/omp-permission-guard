@@ -35,6 +35,11 @@ export interface HeuristicContext {
 	workspaceRoot: string;
 	/** Resolved tool tier; lets the classifier fail safe on unknown write-tier tools. */
 	tier?: ToolTier;
+	/**
+	 * Extra absolute directories the user allowed for this session. A path inside
+	 * any of these is treated as in-bounds, exactly like the workspace root.
+	 */
+	extraRoots?: readonly string[];
 }
 
 /**
@@ -122,6 +127,14 @@ function stringValues(value: unknown): string[] {
 	return [];
 }
 
+/** True when `p` sits inside any session-allowed extra root. */
+function isWithinExtraRoot(p: string, ctx: HeuristicContext): boolean {
+	const roots = ctx.extraRoots;
+	if (!roots || roots.length === 0) return false;
+	const real = realpathOrSelf(p);
+	return roots.some(root => isPathInside(real, realpathOrSelf(root)));
+}
+
 /**
  * Risky-path reason for a single target, or `null` when it is an in-workspace /
  * internal-URL / unknown path that carries no escape risk. Mirrors the skip rules
@@ -129,6 +142,7 @@ function stringValues(value: unknown): string[] {
  */
 function riskyPathReason(targetPath: string, ctx: HeuristicContext): string | null {
 	if (!targetPath || targetPath === "(unknown)" || isInternalUrlPath(targetPath)) return null;
+	if (isWithinExtraRoot(targetPath, ctx)) return null;
 	return classifyRiskyPath(targetPath, ctx.workspaceRoot)?.reason ?? null;
 }
 
@@ -223,7 +237,7 @@ function proveBashSafe(
 		if (isInternalUrlPath(rawCwdArg as string))
 			return uncertain(`Cannot prove bash internal-URL cwd stays in workspace: ${rawCwdArg}`);
 		const resolved = realpathOrSelf(resolveTargetPath(rawCwdArg as string, root));
-		if (!isPathInside(resolved, realRoot)) {
+		if (!isPathInside(resolved, realRoot) && !isWithinExtraRoot(resolved, ctx)) {
 			return deny(`Refusing to run bash outside the workspace root: ${resolved}`);
 		}
 		effectiveCwd = resolved;
@@ -269,7 +283,7 @@ function proveBashSafe(
 			// escalates to the judge, so a punted `cd` is never weaker than a deny.
 			if (i === 0 && head === "cd" && isLiteralPath(target)) {
 				const resolved = realpathOrSelf(resolveTargetPath(target, root));
-				if (!isPathInside(resolved, realRoot)) {
+				if (!isPathInside(resolved, realRoot) && !isWithinExtraRoot(resolved, ctx)) {
 					return deny(`Refusing to run bash outside the workspace root: ${resolved}`);
 				}
 				if (!hasExplicitCwd) effectiveCwd = resolved; // proven in-workspace relocation

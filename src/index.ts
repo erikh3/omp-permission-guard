@@ -125,8 +125,8 @@ function recentUserIntent(ctx: TranscriptCtx): string | undefined {
 }
 
 interface ApprovalOutcome {
-	decision: "allow" | "allow-session" | "deny";
-	/** For a deny: custom text the user typed ("Other") or attached ("note"), forwarded to the agent. */
+	decision: "allow" | "allow-session" | "allow-dir" | "deny";
+	/** For a deny: a message the user typed ("Deny (type your own)"), forwarded to the agent. */
 	message?: string;
 }
 
@@ -146,57 +146,55 @@ async function withBlockedIndicator<T>(ui: ExtensionUIContext, toolName: string,
 }
 
 /**
- * Ask the user to approve a gated call. Prefers the rich ask dialog (labelled
- * options + descriptions, the same surface the ask tool uses); falls back to a
- * plain yes/no confirm on hosts without `askDialog`. `recommended` marks the
- * option the guard leans toward (Deny when it could not prove the call safe).
- * A denial carries any custom text the user typed ("Other") or attached
- * ("note") so their own words reach the agent instead of a generic refusal.
+ * Ask the user to approve a gated call via a labelled radio selector. The guard
+ * recommends Deny when it could not prove the call safe (`recommendDeny`), offers
+ * to whitelist an escaped directory for the session when one is known
+ * (`externalDir`), and — via "Deny (type your own)" — collects a free-text reason
+ * that is forwarded to the agent instead of a generic refusal.
  */
 async function askApproval(
 	ui: ExtensionUIContext,
 	reason: string,
 	toolName: string,
 	argsPreview: string,
-	recommended: number,
+	opts: { recommendDeny: boolean; externalDir?: string },
 ): Promise<ApprovalOutcome> {
-	const question = `${reason}\n${toolName}: ${argsPreview}`;
-	if (ui.askDialog) {
-		const res = await ui.askDialog([
-			{
-				id: "permission-guard",
-				header: "Permission guard",
-				question,
-				options: [
-					{ label: "Allow once", description: "Run this call now." },
-					{ label: "Allow this exact call this session", description: "Skip the prompt for an identical call until you restart or run /guard off." },
-					{ label: "Deny", description: 'Block the call; pick "Other" to tell the agent why in your own words.' },
-				],
-				recommended,
-			},
-		]);
-		if (!res || res.kind !== "submit") return { decision: "deny" };
-		const item = res.results[0];
-		const picked = item?.selectedOptions[0];
-		if (picked === "Allow once") return { decision: "allow" };
-		if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
-		// "Deny", "Other (type your own)", or a bare note -> deny, forwarding the
-		// user's own words to the agent when they supplied any.
-		const custom = item?.customInput?.trim();
-		const note = item?.note?.trim();
-		const message = [custom, note].filter(Boolean).join(" - ") || undefined;
-		return { decision: "deny", message };
+	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
+	const options: { label: string; description: string }[] = [
+		{ label: "Allow once", description: "Run this call now." },
+		{ label: "Allow this exact call this session", description: "Skip the prompt for an identical call until you restart or run /guard off." },
+	];
+	if (opts.externalDir) {
+		options.push({
+			label: `Allow the directory ${opts.externalDir} this session`,
+			description: "Run calls under this directory without asking again this session.",
+		});
 	}
-	const ok = await ui.confirm("Permission guard", `${question}\n\nAllow this call?`, {
-		initialIndex: recommended === 2 ? 1 : 0,
+	options.push({ label: denyLabel, description: "Block the call and tell the agent it was refused." });
+	options.push({ label: "Deny (type your own)", description: "Block the call and type a message the agent will see." });
+
+	const denyIndex = options.findIndex(o => o.label === denyLabel);
+	const picked = await ui.select(`${reason}\n${toolName}: ${argsPreview}`, options, {
+		initialIndex: opts.recommendDeny ? denyIndex : 0,
+		outline: true,
+		selectionMarker: "radio",
 	});
-	return { decision: ok ? "allow" : "deny" };
+	if (picked === "Allow once") return { decision: "allow" };
+	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
+	if (picked?.startsWith("Allow the directory")) return { decision: "allow-dir" };
+	if (picked === "Deny (type your own)") {
+		const message = (await ui.input("Message to the agent", "Why are you denying this call?"))?.trim();
+		return { decision: "deny", message: message || undefined };
+	}
+	// "Deny", "Deny (recommended)", or cancel (undefined) -> block.
+	return { decision: "deny" };
 }
 
 export default function permissionGuard(pi: ExtensionAPI): void {
 	const logger = pi.logger;
 	let sessionMode: Mode | undefined;
 	const sessionAllow = new Set<string>();
+	const sessionAllowedRoots = new Set<string>();
 
 	pi.setLabel("Permission Guard");
 
@@ -276,6 +274,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			intent: recentUserIntent(ctx),
 			escalateBlocked: cfg.escalateBlocked !== false,
 			promptOnBlock: cfg.promptOnBlock !== false,
+			allowedRoots: [...sessionAllowedRoots],
 		});
 
 		if (action.action === "allow") return;
@@ -284,19 +283,27 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// prompt
 		const reason = action.reason ?? "This call could not be proven safe.";
 		if (!ctx.hasUI) return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
-		// The guard only prompts when it could not prove the call safe, so it
-		// recommends Deny (option index 2) unless the lean is neutral.
-		const recommended = action.recommend === "deny" ? 2 : 0;
+		// The guard only prompts when it could not prove the call safe, so it leans
+		// Deny; a workspace-escape reason yields the directory we can offer to allow.
+		const externalDir = /outside the workspace root: (.+)$/.exec(reason)?.[1];
 		// The dialog blocks indefinitely: the host pauses the 30s handler budget
 		// while a tool_call dialog is open, so it resolves only when the user
 		// answers or the turn is aborted (ESC / interrupt / shutdown).
 		const outcome = await withBlockedIndicator(ctx.ui, event.toolName, () =>
-			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), recommended),
+			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), {
+				recommendDeny: action.recommend === "deny",
+				externalDir,
+			}),
 		);
 		if (outcome.decision === "allow") return;
 		if (outcome.decision === "allow-session") {
 			sessionAllow.add(callKey);
 			ctx.ui.notify(`Permission guard: allowing this ${event.toolName} call for the rest of the session.`, "info");
+			return;
+		}
+		if (outcome.decision === "allow-dir" && externalDir) {
+			sessionAllowedRoots.add(externalDir);
+			ctx.ui.notify(`Permission guard: allowing the directory ${externalDir} for the rest of the session.`, "info");
 			return;
 		}
 		return { block: true, reason: `[permission-guard] Denied by user: ${outcome.message ?? reason}` };

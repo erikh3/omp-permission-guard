@@ -48,6 +48,8 @@ export interface EvaluatePermissionInput {
 	 * Default (in the caller) on; set false for a hard wall even interactively.
 	 */
 	promptOnBlock?: boolean;
+	/** Extra absolute directories the user allowed for this session (heuristic/hybrid path containment). */
+	allowedRoots?: readonly string[];
 }
 
 const EXEC_TIER: ToolTier = "exec";
@@ -89,6 +91,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		intent,
 		escalateBlocked,
 		promptOnBlock,
+		allowedRoots,
 	} = input;
 
 	const userPolicy = Object.hasOwn(userPolicies, toolName) ? normalizePolicy(userPolicies[toolName]) : undefined;
@@ -119,7 +122,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 	}
 
 	// heuristic / hybrid: prove-or-block three-state verdict.
-	const verdict = classifyHeuristic(toolName, args, { workspaceRoot, tier });
+	const verdict = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
 	if (verdict.decision === "allow") return { action: "allow" };
 
 	if (verdict.decision === "deny") {
