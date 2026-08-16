@@ -45,7 +45,6 @@ An **explicit user request wins**, without opening a prompt-injection hole:
   "maxAttempts": 3,
   "escalateBlocked": true,
   "promptOnBlock": true,
-  "confirmTimeoutMs": 20000,
   "approval": { "bash": "prompt" }
 }
 ```
@@ -55,10 +54,9 @@ An **explicit user request wins**, without opening a prompt-injection hole:
 - `maxAttempts` — guardian retry budget (default 3).
 - `escalateBlocked` — hybrid only: escalate a heuristic-blocked exec call to the guardian so it can allow an explicitly user-requested action (upgrade-only). Default `true`; set `false` for strict prove-or-block.
 - `promptOnBlock` — when a UI exists, surface a confirm dialog instead of a hard block so you can override; headless runs still hard-deny. Default `true`; set `false` for a hard wall even interactively.
-- `confirmTimeoutMs` — upper bound (ms) on the interactive confirm dialog before it gives up and **denies**. Default `20000`. The host hard-caps every extension handler at 30 s and a plugin cannot raise that, so this value is clamped per call to fit the budget left after the guardian runs — values at or above ~28 s gain nothing. A timed-out prompt always denies (never auto-allows). A window longer than 30 s needs an upstream omp change.
 - `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks.
 
-Runtime: `/guard status` shows the mode, the configured/effective confirm timeout, and the host handler cap; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session.
+Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session. When a call needs confirmation, the dialog waits for your response — there is no timeout, so it stays open until you allow/deny it (or abort the turn with ESC).
 
 ## Install
 
