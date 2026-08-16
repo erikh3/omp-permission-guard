@@ -185,7 +185,7 @@ async function askApproval(
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
 		outline: true,
 		selectionMarker: "radio",
-		helpText: opts.judge ? `${nav}   ·   judge: ${opts.judge}` : undefined,
+		helpText: opts.judge ? `${nav}   ·   ↳ judged by ${opts.judge}` : undefined,
 	});
 	if (picked === "Allow once") return { decision: "allow" };
 	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
