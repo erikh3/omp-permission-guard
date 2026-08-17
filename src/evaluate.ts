@@ -15,7 +15,7 @@ export type GuardMode = "heuristic" | "guardian" | "hybrid";
 export type PermissionAction =
 	| { action: "allow" }
 	| { action: "deny"; reason: string }
-	| { action: "prompt"; reason?: string };
+	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny"; judged?: boolean; confidence?: number };
 
 /** Minimal guardian surface the orchestrator needs. */
 export interface Guardian {
@@ -48,12 +48,14 @@ export interface EvaluatePermissionInput {
 	 * Default (in the caller) on; set false for a hard wall even interactively.
 	 */
 	promptOnBlock?: boolean;
+	/** Extra absolute directories the user allowed for this session (heuristic/hybrid path containment). */
+	allowedRoots?: readonly string[];
 }
 
 const EXEC_TIER: ToolTier = "exec";
 
 function failSafe(hasUI: boolean, reason?: string): PermissionAction {
-	if (hasUI) return reason ? { action: "prompt", reason } : { action: "prompt" };
+	if (hasUI) return reason ? { action: "prompt", reason, recommend: "deny" } : { action: "prompt", recommend: "deny" };
 	return {
 		action: "deny",
 		reason: reason ? `Guardian unavailable: ${reason}` : "Guardian unavailable; denying to fail safe.",
@@ -89,6 +91,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		intent,
 		escalateBlocked,
 		promptOnBlock,
+		allowedRoots,
 	} = input;
 
 	const userPolicy = Object.hasOwn(userPolicies, toolName) ? normalizePolicy(userPolicies[toolName]) : undefined;
@@ -100,8 +103,10 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 	// A blocked call: interactively (and when promptOnBlock) surface a confirm dialog so a human
 	// can override; headless — or strict — it is a hard deny. User-policy denies above are
 	// absolute and never routed through here.
-	const block = (reason: string): PermissionAction =>
-		hasUI && promptOnBlock ? { action: "prompt", reason } : { action: "deny", reason };
+	// `judged` marks a prompt whose deny is the Guardian model's own ruling (as
+	// opposed to a heuristic block or a fail-safe), so the UI can attribute it.
+	const block = (reason: string, judged = false, confidence?: number): PermissionAction =>
+		hasUI && promptOnBlock ? { action: "prompt", reason, recommend: "deny", judged, confidence } : { action: "deny", reason };
 
 	const runGuardian = async (opts: { reason?: string; blocked?: boolean }): Promise<PermissionAction> => {
 		if (!guardian) return failSafe(hasUI, opts.reason);
@@ -110,7 +115,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 			signal,
 		);
 		if (verdict.decision === "allow") return { action: "allow" };
-		if (verdict.decision === "deny") return block(verdict.reason);
+		if (verdict.decision === "deny") return block(verdict.reason, true, verdict.confidence);
 		return failSafe(hasUI, opts.reason);
 	};
 
@@ -119,7 +124,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 	}
 
 	// heuristic / hybrid: prove-or-block three-state verdict.
-	const verdict = classifyHeuristic(toolName, args, { workspaceRoot, tier });
+	const verdict = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
 	if (verdict.decision === "allow") return { action: "allow" };
 
 	if (verdict.decision === "deny") {

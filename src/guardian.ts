@@ -44,6 +44,10 @@ const verdictTool: Tool = {
 				type: "string",
 				description: "Short justification for the decision; required when denying.",
 			},
+			confidence: {
+				type: "number",
+				description: "Confidence in this decision from 0 (unsure) to 1 (certain).",
+			},
 		},
 		required: ["decision"],
 		additionalProperties: false,
@@ -52,8 +56,8 @@ const verdictTool: Tool = {
 
 /** Outcome of a Guardian review. `error` means retries were exhausted / unavailable. */
 export type GuardianVerdict =
-	| { decision: "allow"; reason?: string }
-	| { decision: "deny"; reason: string }
+	| { decision: "allow"; reason?: string; confidence?: number }
+	| { decision: "deny"; reason: string; confidence?: number }
 	| { decision: "error" };
 
 export interface GuardianRequest {
@@ -160,8 +164,10 @@ function parseVerdict(content: AssistantMessage["content"]): GuardianVerdict | n
 		if (block.type === "toolCall" && block.name === VERDICT_TOOL_NAME) {
 			const args = block.arguments as Record<string, unknown>;
 			const reason = typeof args.reason === "string" && args.reason.length > 0 ? args.reason : undefined;
-			if (args.decision === "allow") return reason ? { decision: "allow", reason } : { decision: "allow" };
-			if (args.decision === "deny") return { decision: "deny", reason: reason ?? "Guardian denied the tool call." };
+			const confidence =
+				typeof args.confidence === "number" && args.confidence >= 0 && args.confidence <= 1 ? args.confidence : undefined;
+			if (args.decision === "allow") return { decision: "allow", reason, confidence };
+			if (args.decision === "deny") return { decision: "deny", reason: reason ?? "Guardian denied the tool call.", confidence };
 		}
 	}
 	return null;
@@ -202,6 +208,18 @@ export class GuardianJudge {
 	 */
 	async evaluate(req: GuardianRequest, signal?: AbortSignal): Promise<GuardianVerdict> {
 		const log = this.#deps.logger?.debug ?? (() => {});
+		let argsPreview: string;
+		try {
+			argsPreview = (JSON.stringify(req.args) ?? "undefined").slice(0, 500);
+		} catch {
+			argsPreview = "(unserializable)";
+		}
+		log(`[permission-guard] escalate ${req.toolName}: ${argsPreview}`, {
+			tool: req.toolName,
+			args: argsPreview,
+			trigger: req.blocked ? "blocked" : "uncertain",
+			reason: req.reason,
+		});
 		const completeSimple = await loadCompleteSimple();
 		if (!completeSimple) {
 			log("guardian: completeSimple unavailable");
@@ -247,7 +265,15 @@ export class GuardianJudge {
 					throw new Error(response.errorMessage ?? "guardian completion error");
 				}
 				const verdict = parseVerdict(response.content);
-				if (verdict) return verdict;
+				if (verdict) {
+					log(`[permission-guard] guardian verdict ${verdict.decision} for ${req.toolName}`, {
+						tool: req.toolName,
+						decision: verdict.decision,
+						reason: verdict.reason,
+						confidence: verdict.confidence,
+					});
+					return verdict;
+				}
 				throw new Error("guardian returned no parseable verdict");
 			} catch (err) {
 				if (signal?.aborted) return { decision: "error" };

@@ -56,7 +56,29 @@ An **explicit user request wins**, without opening a prompt-injection hole:
 - `promptOnBlock` — when a UI exists, surface a confirm dialog instead of a hard block so you can override; headless runs still hard-deny. Default `true`; set `false` for a hard wall even interactively.
 - `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks.
 
-Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches it for the current session.
+Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session. When a call needs confirmation, the guard pauses the agent (the streaming spinner switches to "waiting for you to approve …") and shows a selector:
+
+- **Allow once** — run this call now.
+- **Allow this exact call this session** — skip the prompt for an identical call until you restart or `/guard off`.
+- **Allow the directory `<dir>` this session** — shown only when the call was blocked for escaping the workspace root; whitelists that directory for the rest of the session so calls under it stop prompting.
+- **Deny** — block and tell the agent it was refused. The guard only prompts when it could not prove the call safe, so Deny is **pre-selected**.
+- **Deny (type your own)** — block and type a message that is forwarded to the agent verbatim.
+
+The dialog waits until you choose (ESC denies). When the guardian model produced the ruling behind a prompt (a guardian **deny** in guardian/hybrid mode), the footer names the judging model and its self-reported confidence (e.g. `↳ judged by <model> (confidence 0.9)`); heuristic blocks, fail-safes, and declined escalations show no judge (the model did not rule).
+
+The "this session" choices (allow this exact call, allow the directory) are held in memory for the running session only — they are never written to `permission-guard.json` and are cleared on restart. For a persistent rule, add an `approval` entry (e.g. `"bash": "allow"`) to the config file instead.
+
+## Debugging
+
+The guard emits a `[permission-guard]` debug log for every decision it makes, so you can trace exactly what was gated and why. Each line carries the tool name and an argument preview in the message, plus a structured payload:
+
+- **verdict** — `allow` or `deny` (the message begins with this).
+- **`tool`, `args`, `tier`, `mode`** — the call and how it was classified.
+- **`via`** — where the decision came from: `session-cache` (a prior "allow this call"), `classifier` (heuristic/guardian auto allow/deny), `headless` (no UI, hard deny), or `prompt` (you were asked).
+- **`choice`** — for a prompt, what you picked: `allow-once`, `allow-session`, `allow-dir` (with `dir`), `deny`, or `deny-custom` (with your `reason`).
+- **`reason`** — the classifier/guardian explanation or your typed message.
+
+Escalations to the Guardian judge log separately: `[permission-guard] escalate <tool>: <args>` (with `trigger: blocked | uncertain`) when the judge is invoked, and `[permission-guard] guardian verdict <decision> for <tool>` with its ruling. Grep your omp debug log for `[permission-guard]` to see the full decision trail.
 
 ## Install
 

@@ -35,6 +35,11 @@ export interface HeuristicContext {
 	workspaceRoot: string;
 	/** Resolved tool tier; lets the classifier fail safe on unknown write-tier tools. */
 	tier?: ToolTier;
+	/**
+	 * Extra absolute directories the user allowed for this session. A path inside
+	 * any of these is treated as in-bounds, exactly like the workspace root.
+	 */
+	extraRoots?: readonly string[];
 }
 
 /**
@@ -122,6 +127,14 @@ function stringValues(value: unknown): string[] {
 	return [];
 }
 
+/** True when `p` sits inside any session-allowed extra root. */
+function isWithinExtraRoot(p: string, ctx: HeuristicContext): boolean {
+	const roots = ctx.extraRoots;
+	if (!roots || roots.length === 0) return false;
+	const real = realpathOrSelf(p);
+	return roots.some(root => isPathInside(real, realpathOrSelf(root)));
+}
+
 /**
  * Risky-path reason for a single target, or `null` when it is an in-workspace /
  * internal-URL / unknown path that carries no escape risk. Mirrors the skip rules
@@ -129,6 +142,7 @@ function stringValues(value: unknown): string[] {
  */
 function riskyPathReason(targetPath: string, ctx: HeuristicContext): string | null {
 	if (!targetPath || targetPath === "(unknown)" || isInternalUrlPath(targetPath)) return null;
+	if (isWithinExtraRoot(targetPath, ctx)) return null;
 	return classifyRiskyPath(targetPath, ctx.workspaceRoot)?.reason ?? null;
 }
 
@@ -223,7 +237,7 @@ function proveBashSafe(
 		if (isInternalUrlPath(rawCwdArg as string))
 			return uncertain(`Cannot prove bash internal-URL cwd stays in workspace: ${rawCwdArg}`);
 		const resolved = realpathOrSelf(resolveTargetPath(rawCwdArg as string, root));
-		if (!isPathInside(resolved, realRoot)) {
+		if (!isPathInside(resolved, realRoot) && !isWithinExtraRoot(resolved, ctx)) {
 			return deny(`Refusing to run bash outside the workspace root: ${resolved}`);
 		}
 		effectiveCwd = resolved;
@@ -269,7 +283,7 @@ function proveBashSafe(
 			// escalates to the judge, so a punted `cd` is never weaker than a deny.
 			if (i === 0 && head === "cd" && isLiteralPath(target)) {
 				const resolved = realpathOrSelf(resolveTargetPath(target, root));
-				if (!isPathInside(resolved, realRoot)) {
+				if (!isPathInside(resolved, realRoot) && !isWithinExtraRoot(resolved, ctx)) {
 					return deny(`Refusing to run bash outside the workspace root: ${resolved}`);
 				}
 				if (!hasExplicitCwd) effectiveCwd = resolved; // proven in-workspace relocation
@@ -336,7 +350,9 @@ function proveBashSafe(
  *
  * - `bash`: `proveBashSafe` (see there) — allow only a flat in-workspace command
  *   with no dangerous effect; uncertain for anything that relocates execution.
- * - `eval`: dangerous-code in any cell → deny; otherwise allow.
+ * - `todo`: session-local task tracker with no fs/exec effect → always allow.
+ * - `eval`: a destructive shell pattern embedded in the code → deny; otherwise
+ *   uncertain (arbitrary unsandboxed code is never provably safe).
  * - `write` / `edit` / `ast_edit` / `tts`: every caller-supplied path proved
  *   in-workspace → allow; a risky one → deny; NO path supplied → uncertain.
  * - `lsp`: read-tier → allow; `request` allowed only for a frozen read-only
@@ -347,6 +363,11 @@ function proveBashSafe(
 export function classifyHeuristic(toolName: string, args: unknown, ctx: HeuristicContext): HeuristicVerdict {
 	const record = asRecord(args);
 	switch (toolName) {
+		case "todo":
+		case "ask":
+			// Session-local tools with no filesystem/exec/network effect (task tracker,
+			// user prompt): always safe.
+			return ALLOW;
 		case "bash": {
 			const command = typeof record.command === "string" ? record.command : "";
 			const rawCwd = typeof record.cwd === "string" && record.cwd.length > 0 ? record.cwd : undefined;
@@ -354,12 +375,20 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 			return proveBashSafe(command, rawCwd, ctx, env);
 		}
 		case "eval": {
-			const cells = Array.isArray(record.cells) ? record.cells : [];
-			for (const cell of cells) {
-				const code = asRecord(cell).code;
-				if (typeof code === "string" && containsDangerousCode(code)) {
-					return deny("Detected a potentially destructive command in eval cell code.");
+			// The eval tool passes a single `code` string (batch variants may use a
+			// `cells` array); gather every fragment. A shell-dangerous pattern embedded
+			// in the code (e.g. os.system("rm -rf …")) is a deny; otherwise arbitrary
+			// unsandboxed code cannot be statically proven safe -> uncertain.
+			const fragments: string[] = [];
+			if (typeof record.code === "string") fragments.push(record.code);
+			if (Array.isArray(record.cells)) {
+				for (const cell of record.cells) {
+					const cellCode = asRecord(cell).code;
+					if (typeof cellCode === "string") fragments.push(cellCode);
 				}
+			}
+			if (fragments.some(containsDangerousCode)) {
+				return deny("Detected a potentially destructive command in eval code.");
 			}
 			return uncertain("eval runs arbitrary unsandboxed code and cannot be statically proven workspace-safe");
 		}

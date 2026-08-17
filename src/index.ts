@@ -18,7 +18,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import { evaluatePermission, type GuardMode } from "./evaluate";
 import { GuardianJudge } from "./guardian";
 import { getToolTier } from "./tier";
@@ -124,9 +124,89 @@ function recentUserIntent(ctx: TranscriptCtx): string | undefined {
 	return joined.length > MAX_INTENT_CHARS ? joined.slice(joined.length - MAX_INTENT_CHARS) : joined;
 }
 
+interface ApprovalOutcome {
+	decision: "allow" | "allow-session" | "allow-dir" | "deny";
+	/** For a deny: a message the user typed ("Deny (type your own)"), forwarded to the agent. */
+	message?: string;
+}
+
+/**
+ * Swap the streaming spinner to a clear "paused, waiting on you" message while
+ * an approval dialog is open, then restore it. Without this the host keeps
+ * showing the in-flight tool's own working message, so a blocked agent looks
+ * like it is still busy running the tool.
+ */
+async function withBlockedIndicator<T>(ui: ExtensionUIContext, toolName: string, run: () => Promise<T>): Promise<T> {
+	ui.setWorkingMessage?.(`Permission guard: waiting for you to approve ${toolName}`);
+	try {
+		return await run();
+	} finally {
+		ui.setWorkingMessage?.();
+	}
+}
+
+/**
+ * Ask the user to approve a gated call via a labelled radio selector. The guard
+ * recommends Deny when it could not prove the call safe (`recommendDeny`), offers
+ * to whitelist an escaped directory for the session when one is known
+ * (`externalDir`), and — via "Deny (type your own)" — collects a free-text reason
+ * that is forwarded to the agent instead of a generic refusal.
+ */
+async function askApproval(
+	ui: ExtensionUIContext,
+	reason: string,
+	toolName: string,
+	argsPreview: string,
+	opts: { recommendDeny: boolean; externalDir?: string; judge?: string; confidence?: number; hideCall?: boolean },
+): Promise<ApprovalOutcome> {
+	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
+	const options: string[] = ["Allow once", "Allow this exact call this session"];
+	if (opts.externalDir) options.push(`Allow the directory ${opts.externalDir} this session`);
+	options.push(denyLabel, "Deny (type your own)");
+
+	// The host selector renders the title through its own highlighter (directory
+	// paths in the reason, shell syntax in the command), so we pass plain text and
+	// let it style consistently. Embedding our own ANSI double-styles the text and
+	// the colors flip when a theme re-render (e.g. focus change) re-runs the
+	// highlighter over our codes. `hideCall` drops the command line entirely when
+	// the host already shows the call above the prompt (e.g. an `eval` py block).
+	// `previewArgs` clips a long command with a trailing ellipsis; surface that as
+	// an explicit "(truncated)" note instead.
+	const truncated = argsPreview.endsWith("…");
+	const shownArgs = truncated ? `${argsPreview.slice(0, -1)}...(truncated)` : argsPreview;
+	const title = opts.hideCall ? reason : `${reason}\n\n${toolName}: ${shownArgs}`;
+
+	const denyIndex = options.indexOf(denyLabel);
+	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends),
+	// so reconstruct the nav hints and append the judge model — the only edge slot
+	// the selector exposes. `opts.judge` is set only when the guardian model
+	// produced the ruling behind this prompt (a guardian deny), not on a heuristic
+	// block, a fail-safe, or an escalation the model declined.
+	const nav = "up/down navigate  enter select  esc cancel";
+	const picked = await ui.select(title, options, {
+		initialIndex: opts.recommendDeny ? denyIndex : 0,
+		outline: true,
+		selectionMarker: "radio",
+		helpText: opts.judge
+			? `${nav}   ·   ↳ judged by ${opts.judge}${opts.confidence !== undefined ? ` (confidence ${opts.confidence})` : ""}`
+			: undefined,
+	});
+	if (picked === "Allow once") return { decision: "allow" };
+	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
+	if (picked?.startsWith("Allow the directory")) return { decision: "allow-dir" };
+	if (picked === "Deny (type your own)") {
+		const message = (await ui.input("Message to the agent", "Why are you denying this call?"))?.trim();
+		return { decision: "deny", message: message || undefined };
+	}
+	// "Deny", "Deny (recommended)", or cancel (undefined) -> block.
+	return { decision: "deny" };
+}
+
 export default function permissionGuard(pi: ExtensionAPI): void {
 	const logger = pi.logger;
 	let sessionMode: Mode | undefined;
+	const sessionAllow = new Set<string>();
+	const sessionAllowedRoots = new Set<string>();
 
 	pi.setLabel("Permission Guard");
 
@@ -169,7 +249,23 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		const tier = getToolTier(event.toolName, event.input, tools);
 		if (tier === "read") return; // read-tier tools carry no write/exec risk
 
+		const argsPreview = previewArgs(event.toolName, event.input);
+		const log = (verdict: string, extra?: Record<string, unknown>) =>
+			logger?.debug?.(`[permission-guard] ${verdict} ${event.toolName}: ${argsPreview}`, {
+				tool: event.toolName,
+				args: argsPreview,
+				tier,
+				mode,
+				...extra,
+			});
+		const callKey = `${event.toolName}:${JSON.stringify(event.input)}`;
+		if (sessionAllow.has(callKey)) {
+			log("allow", { via: "session-cache" });
+			return;
+		}
+
 		const cfg = loadConfig(logger);
+		let judgeModel: Model<Api> | undefined;
 		const guardian =
 			mode === "guardian" || mode === "hybrid"
 				? new GuardianJudge(
@@ -178,12 +274,12 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 								const models = ctx.models;
 								if (!models) return undefined;
 								const spec = cfg.guardianModel?.trim();
-								return (
+								judgeModel =
 									(spec ? models.resolve(spec) : undefined) ??
 									models.resolve("@smol") ??
 									models.resolve("@commit") ??
-									models.current()
-								);
+									models.current();
+								return judgeModel;
 							},
 							getApiKey: (model: Model<Api>) => ctx.modelRegistry.getApiKey(model),
 							logger,
@@ -204,18 +300,67 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			intent: recentUserIntent(ctx),
 			escalateBlocked: cfg.escalateBlocked !== false,
 			promptOnBlock: cfg.promptOnBlock !== false,
+			// Session dir-allow choices + omp's multi-root workspace dirs (`/add-dir`),
+			// both treated as in-workspace by the containment heuristic.
+			allowedRoots: [...sessionAllowedRoots, ...(ctx.sessionManager?.getAdditionalDirectories?.() ?? [])],
 		});
 
-		if (action.action === "allow") return;
-		if (action.action === "deny") return { block: true, reason: `[permission-guard] ${action.reason}` };
+		if (action.action === "allow") {
+			log("allow", { via: "classifier" });
+			return;
+		}
+		if (action.action === "deny") {
+			log("deny", { via: "classifier", reason: action.reason });
+			return { block: true, reason: `[permission-guard] ${action.reason}` };
+		}
 
 		// prompt
 		const reason = action.reason ?? "This call could not be proven safe.";
-		if (!ctx.hasUI) return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
-		const ok = await ctx.ui.confirm(
-			"Permission guard",
-			`${reason}\n\n${event.toolName}: ${previewArgs(event.toolName, event.input)}\n\nAllow this call?`,
+		if (!ctx.hasUI) {
+			log("deny", { via: "headless", reason });
+			return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
+		}
+		// The guard only prompts when it could not prove the call safe, so it leans
+		// Deny; a workspace-escape reason yields the directory we can offer to allow.
+		const externalDir = /outside the workspace root: (.+)$/.exec(reason)?.[1];
+		// The host renders `eval` py code as a block above the prompt, so skip the
+		// redundant command line for those.
+		const input = event.input;
+		const hideCall =
+			event.toolName === "eval" &&
+			typeof input === "object" &&
+			input !== null &&
+			"language" in input &&
+			input.language === "py";
+		// The dialog blocks indefinitely: the host pauses the 30s handler budget
+		// while a tool_call dialog is open, so it resolves only when the user
+		// answers or the turn is aborted (ESC / interrupt / shutdown).
+		const outcome = await withBlockedIndicator(ctx.ui, event.toolName, () =>
+			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), {
+				recommendDeny: action.recommend === "deny",
+				externalDir,
+				judge: action.judged && judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
+				confidence: action.judged ? action.confidence : undefined,
+				hideCall,
+			}),
 		);
-		if (!ok) return { block: true, reason: `[permission-guard] Denied by user: ${reason}` };
+		if (outcome.decision === "allow") {
+			log("allow", { via: "prompt", choice: "allow-once" });
+			return;
+		}
+		if (outcome.decision === "allow-session") {
+			sessionAllow.add(callKey);
+			log("allow", { via: "prompt", choice: "allow-session" });
+			ctx.ui.notify(`Permission guard: allowing this ${event.toolName} call for the rest of the session.`, "info");
+			return;
+		}
+		if (outcome.decision === "allow-dir" && externalDir) {
+			sessionAllowedRoots.add(externalDir);
+			log("allow", { via: "prompt", choice: "allow-dir", dir: externalDir });
+			ctx.ui.notify(`Permission guard: allowing the directory ${externalDir} for the rest of the session.`, "info");
+			return;
+		}
+		log("deny", { via: "prompt", choice: outcome.message ? "deny-custom" : "deny", reason: outcome.message ?? reason });
+		return { block: true, reason: `[permission-guard] Denied by user: ${outcome.message ?? reason}` };
 	});
 }
