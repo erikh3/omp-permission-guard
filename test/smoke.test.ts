@@ -129,6 +129,55 @@ describe("classifyHeuristic (other tools)", () => {
 		const paths = extractAllApprovalPaths({ path: "src/a.ts", edits: [{ rename: "src/b.ts" }] });
 		expect(paths).toContain("src/b.ts");
 	});
+	test("hub send to a peer (agent messaging) -> allow", () => {
+		const args = { op: "send", to: "BridgeEndpoints", message: "status?" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
+	});
+	test("hub wait / list / jobs (coordination + inspection) -> allow", () => {
+		for (const op of ["wait", "inbox", "list", "jobs", "ps", "logs", "describe"]) {
+			expect(classifyHeuristic("hub", { op }, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
+		}
+	});
+	test("hub wait scoped to a process (name present, not a send) -> allow", () => {
+		const args = { op: "wait", name: "difit", for: "exit", timeout: 1800 };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
+	});
+	test("hub start (launches an arbitrary process) -> uncertain", () => {
+		const args = { op: "start", name: "web", application: "bun", args: ["run", "dev"] };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub send writing into a live process (name present) -> uncertain", () => {
+		const args = { op: "send", name: "debugger", text: "os.system('rm -rf ~')" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub with no op (unknown shape) -> uncertain", () => {
+		expect(classifyHeuristic("hub", {}, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub with an unknown/future op -> uncertain (allowlist fails closed)", () => {
+		const args = { op: "exec_shell", command: "rm -rf /" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub stop (mutates process lifecycle) -> uncertain", () => {
+		const args = { op: "stop", name: "web" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub cancel (mutates job lifecycle) -> uncertain", () => {
+		const args = { op: "cancel", ids: ["bash_x"] };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	// restart re-launches an arbitrary retained spec, gated like start
+	test("hub restart (re-launches retained spec) -> uncertain", () => {
+		const args = { op: "restart", name: "web" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub send with both to and name (process-directed wins, fails closed) -> uncertain", () => {
+		const args = { op: "send", to: "Peer", name: "debugger", text: "x" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("hub send with empty-string name key (name key present -> process-directed) -> uncertain", () => {
+		const args = { op: "send", to: "Peer", name: "" };
+		expect(classifyHeuristic("hub", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
 });
 
 describe("getToolTier", () => {
@@ -214,6 +263,48 @@ describe("evaluatePermission (no guardian)", () => {
 			hasUI: true,
 		});
 		expect(a.action).toBe("allow");
+	});
+	test("guardian mode: benign hub send -> allow without invoking the judge", async () => {
+		const a = await evaluatePermission({
+			toolName: "hub",
+			args: { op: "send", to: "BridgeEndpoints", message: "status?" },
+			tier: "exec",
+			mode: "guardian",
+			...base,
+		});
+		expect(a.action).toBe("allow");
+	});
+	test("guardian mode: hub start still gated (no guardian -> fail safe prompt)", async () => {
+		const a = await evaluatePermission({
+			toolName: "hub",
+			args: { op: "start", name: "web", application: "bun", args: ["run", "dev"] },
+			tier: "exec",
+			mode: "guardian",
+			...base,
+		});
+		expect(a.action).toBe("prompt");
+	});
+	test("guardian mode: hub restart now gated (no guardian -> fail safe prompt)", async () => {
+		const a = await evaluatePermission({
+			toolName: "hub",
+			args: { op: "restart", name: "web" },
+			tier: "exec",
+			mode: "guardian",
+			...base,
+		});
+		expect(a.action).toBe("prompt");
+	});
+	test("guardian mode: user policy hub:deny overrides guardian hub short-circuit -> deny", async () => {
+		const a = await evaluatePermission({
+			toolName: "hub",
+			args: { op: "send", to: "X", message: "hi" },
+			tier: "exec",
+			mode: "guardian",
+			userPolicies: { hub: "deny" },
+			workspaceRoot: WS,
+			hasUI: true,
+		});
+		expect(a.action).toBe("deny");
 	});
 });
 

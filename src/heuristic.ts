@@ -346,6 +346,45 @@ function proveBashSafe(
 }
 
 /**
+ * `hub` multiplexes agent coordination and process control behind one tool, so
+ * core tiers the whole thing `exec`. Prove-or-block means an ALLOWLIST: a call is
+ * provably safe only when its op is peer messaging (`send` to a peer — no `name`
+ * key) or a read-only inspection op (`wait`, `inbox`, `list`, `jobs`, `ps`,
+ * `logs`, `describe`). These are harmless regardless of target. Peer messaging is
+ * allowed on the assumption that each peer/subagent is independently gated by its
+ * own guard.
+ *
+ * NOT provably safe (must be gated):
+ * - `start` — launches an arbitrary `application` + `args` that may harm the host.
+ * - `restart` — re-runs a retained launch spec; equivalent to `start` in effect.
+ * - `stop` / `cancel` — mutate process/job lifecycle; a bare `name`/`id` does not
+ *   prove the target is safe to kill.
+ * - process-directed `send` — the `name` key being present means stdin, keystrokes,
+ *   or a signal are being injected into a live process, which is an arbitrary-code /
+ *   process-control vector regardless of the key's value.
+ * - any unknown/future op — cannot be proven safe from args alone.
+ */
+const SAFE_HUB_OPS: Record<string, true> = {
+	send: true,
+	wait: true,
+	inbox: true,
+	list: true,
+	jobs: true,
+	ps: true,
+	logs: true,
+	describe: true,
+};
+
+export function isProvablySafeHubCall(args: unknown): boolean {
+	const record = asRecord(args);
+	const op = typeof record.op === "string" ? record.op : "";
+	if (!Object.hasOwn(SAFE_HUB_OPS, op)) return false; // unknown / lifecycle ops (e.g. `start`, `restart`, `stop`, `cancel`) are not proven safe
+	// `send` to a process (name key present) injects stdin/keys/signals into a live process.
+	if (op === "send" && Object.hasOwn(record, "name")) return false;
+	return true;
+}
+
+/**
  * Classify a tool call by tool name under prove-or-block semantics.
  *
  * - `bash`: `proveBashSafe` (see there) — allow only a flat in-workspace command
@@ -358,6 +397,9 @@ function proveBashSafe(
  * - `lsp`: read-tier → allow; `request` allowed only for a frozen read-only
  *   method set; write actions via the path rule.
  * - `generate_image` / `report_tool_issue`: fixed write target, no caller path → allow.
+ * - `hub`: peer `send` (no `name` key) + `wait`/`inbox`/`list`/`jobs`/`ps`/`logs`/`describe`
+ *   → allow; `start`/`restart`/`stop`/`cancel`, process-directed `send` (has `name` key),
+ *   and unknown ops → uncertain.
  * - any other write/exec-tier tool → uncertain (cannot introspect); read-tier → allow.
  */
 export function classifyHeuristic(toolName: string, args: unknown, ctx: HeuristicContext): HeuristicVerdict {
@@ -422,6 +464,15 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 			// Write-tier, but the write target is fixed / tool-allocated with no
 			// caller-controlled path (`generate_image.input[].path` is a read source).
 			return ALLOW;
+		case "hub":
+			// Agent-coordination / read-only inspection ops are provably safe; lifecycle
+			// mutations (`start`, `restart`, `stop`, `cancel`) and process-directed `send`
+			// stay un-provable and must be gated.
+			return isProvablySafeHubCall(args)
+				? ALLOW
+				: uncertain(
+						`hub ${typeof record.op === "string" ? record.op : "call"} mutates process/job state or is unrecognized and cannot be statically proven safe`,
+					);
 		default:
 			// An unrecognized write- or exec-tier tool cannot be introspected for
 			// safety, so it is uncertain — heuristic mode denies, hybrid escalates to
