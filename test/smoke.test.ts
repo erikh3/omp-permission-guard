@@ -349,4 +349,9 @@ describe("evaluatePermission (promptOnBlock human override)", () => {
 		const a = await evaluatePermission({ ...CRIT, mode: "hybrid", guardian: denyGuardian, escalateBlocked: true, promptOnBlock: true, ...base });
 		expect(a.action === "prompt" && !a.judged).toBe(true);
 	});
+	test("guardian deny propagates confidence to the prompt action", async () => {
+		const conf = { evaluate: async () => ({ decision: "deny" as const, reason: "no", confidence: 0.9 }) };
+		const a = await evaluatePermission({ ...CRIT, mode: "guardian", guardian: conf, promptOnBlock: true, ...base });
+		expect(a.action === "prompt" && a.confidence).toBe(0.9);
+	});
 });

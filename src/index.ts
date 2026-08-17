@@ -157,7 +157,7 @@ async function askApproval(
 	reason: string,
 	toolName: string,
 	argsPreview: string,
-	opts: { recommendDeny: boolean; externalDir?: string; judge?: string; hideCall?: boolean },
+	opts: { recommendDeny: boolean; externalDir?: string; judge?: string; confidence?: number; hideCall?: boolean },
 ): Promise<ApprovalOutcome> {
 	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
 	const options: string[] = ["Allow once", "Allow this exact call this session"];
@@ -187,7 +187,9 @@ async function askApproval(
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
 		outline: true,
 		selectionMarker: "radio",
-		helpText: opts.judge ? `${nav}   ·   ↳ judged by ${opts.judge}` : undefined,
+		helpText: opts.judge
+			? `${nav}   ·   ↳ judged by ${opts.judge}${opts.confidence !== undefined ? ` (confidence ${opts.confidence})` : ""}`
+			: undefined,
 	});
 	if (picked === "Allow once") return { decision: "allow" };
 	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
@@ -338,6 +340,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				recommendDeny: action.recommend === "deny",
 				externalDir,
 				judge: action.judged && judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
+				confidence: action.judged ? action.confidence : undefined,
 				hideCall,
 			}),
 		);

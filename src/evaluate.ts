@@ -15,7 +15,7 @@ export type GuardMode = "heuristic" | "guardian" | "hybrid";
 export type PermissionAction =
 	| { action: "allow" }
 	| { action: "deny"; reason: string }
-	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny"; judged?: boolean };
+	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny"; judged?: boolean; confidence?: number };
 
 /** Minimal guardian surface the orchestrator needs. */
 export interface Guardian {
@@ -105,8 +105,8 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 	// absolute and never routed through here.
 	// `judged` marks a prompt whose deny is the Guardian model's own ruling (as
 	// opposed to a heuristic block or a fail-safe), so the UI can attribute it.
-	const block = (reason: string, judged = false): PermissionAction =>
-		hasUI && promptOnBlock ? { action: "prompt", reason, recommend: "deny", judged } : { action: "deny", reason };
+	const block = (reason: string, judged = false, confidence?: number): PermissionAction =>
+		hasUI && promptOnBlock ? { action: "prompt", reason, recommend: "deny", judged, confidence } : { action: "deny", reason };
 
 	const runGuardian = async (opts: { reason?: string; blocked?: boolean }): Promise<PermissionAction> => {
 		if (!guardian) return failSafe(hasUI, opts.reason);
@@ -115,7 +115,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 			signal,
 		);
 		if (verdict.decision === "allow") return { action: "allow" };
-		if (verdict.decision === "deny") return block(verdict.reason, true);
+		if (verdict.decision === "deny") return block(verdict.reason, true, verdict.confidence);
 		return failSafe(hasUI, opts.reason);
 	};
 

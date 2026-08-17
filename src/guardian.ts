@@ -44,6 +44,10 @@ const verdictTool: Tool = {
 				type: "string",
 				description: "Short justification for the decision; required when denying.",
 			},
+			confidence: {
+				type: "number",
+				description: "Confidence in this decision from 0 (unsure) to 1 (certain).",
+			},
 		},
 		required: ["decision"],
 		additionalProperties: false,
@@ -52,8 +56,8 @@ const verdictTool: Tool = {
 
 /** Outcome of a Guardian review. `error` means retries were exhausted / unavailable. */
 export type GuardianVerdict =
-	| { decision: "allow"; reason?: string }
-	| { decision: "deny"; reason: string }
+	| { decision: "allow"; reason?: string; confidence?: number }
+	| { decision: "deny"; reason: string; confidence?: number }
 	| { decision: "error" };
 
 export interface GuardianRequest {
@@ -160,8 +164,10 @@ function parseVerdict(content: AssistantMessage["content"]): GuardianVerdict | n
 		if (block.type === "toolCall" && block.name === VERDICT_TOOL_NAME) {
 			const args = block.arguments as Record<string, unknown>;
 			const reason = typeof args.reason === "string" && args.reason.length > 0 ? args.reason : undefined;
-			if (args.decision === "allow") return reason ? { decision: "allow", reason } : { decision: "allow" };
-			if (args.decision === "deny") return { decision: "deny", reason: reason ?? "Guardian denied the tool call." };
+			const confidence =
+				typeof args.confidence === "number" && args.confidence >= 0 && args.confidence <= 1 ? args.confidence : undefined;
+			if (args.decision === "allow") return { decision: "allow", reason, confidence };
+			if (args.decision === "deny") return { decision: "deny", reason: reason ?? "Guardian denied the tool call.", confidence };
 		}
 	}
 	return null;
@@ -264,6 +270,7 @@ export class GuardianJudge {
 						tool: req.toolName,
 						decision: verdict.decision,
 						reason: verdict.reason,
+						confidence: verdict.confidence,
 					});
 					return verdict;
 				}

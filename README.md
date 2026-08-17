@@ -64,7 +64,7 @@ Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`
 - **Deny** — block and tell the agent it was refused. The guard only prompts when it could not prove the call safe, so Deny is **pre-selected**.
 - **Deny (type your own)** — block and type a message that is forwarded to the agent verbatim.
 
-The dialog waits until you choose (ESC denies). When the guardian model produced the ruling behind a prompt (a guardian **deny** in guardian/hybrid mode), the footer names the judging model; heuristic blocks, fail-safes, and declined escalations show no judge (the model did not rule).
+The dialog waits until you choose (ESC denies). When the guardian model produced the ruling behind a prompt (a guardian **deny** in guardian/hybrid mode), the footer names the judging model and its self-reported confidence (e.g. `↳ judged by <model> (confidence 0.9)`); heuristic blocks, fail-safes, and declined escalations show no judge (the model did not rule).
 
 The "this session" choices (allow this exact call, allow the directory) are held in memory for the running session only — they are never written to `permission-guard.json` and are cleared on restart. For a persistent rule, add an `approval` entry (e.g. `"bash": "allow"`) to the config file instead.
 

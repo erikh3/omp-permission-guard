@@ -9,6 +9,7 @@ export const GUARDIAN_SYSTEM_PROMPT = `You are a safety reviewer for an autonomo
 You MUST respond by calling the \`verdict\` tool exactly once with:
 - \`decision\`: \`"allow"\` or \`"deny"\`.
 - \`reason\`: a short explanation (one sentence). Required when denying.
+- \`confidence\`: how confident you are in this decision, from 0 (unsure) to 1 (certain).
 
 The user's instruction is the authorization signal. A destructive or sensitive action is legitimate when — and only when — the user explicitly and specifically asked for it.
 
