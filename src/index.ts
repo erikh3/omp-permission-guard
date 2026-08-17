@@ -157,7 +157,7 @@ async function askApproval(
 	reason: string,
 	toolName: string,
 	argsPreview: string,
-	opts: { recommendDeny: boolean; externalDir?: string; judge?: string },
+	opts: { recommendDeny: boolean; externalDir?: string; judge?: string; hideCall?: boolean },
 ): Promise<ApprovalOutcome> {
 	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
 	const options: string[] = ["Allow once", "Allow this exact call this session"];
@@ -166,13 +166,15 @@ async function askApproval(
 
 	// The host selector renders the title through its own highlighter (directory
 	// paths in the reason, shell syntax in the command), so we pass plain text and
-	// let it style consistently. Embedding our own ANSI here double-styles the
-	// text and the colors flip when a theme re-render (e.g. focus change) re-runs
-	// the highlighter over our codes. `previewArgs` clips a long command with a
-	// trailing ellipsis; surface that as an explicit "(truncated)" note instead.
+	// let it style consistently. Embedding our own ANSI double-styles the text and
+	// the colors flip when a theme re-render (e.g. focus change) re-runs the
+	// highlighter over our codes. `hideCall` drops the command line entirely when
+	// the host already shows the call above the prompt (e.g. an `eval` py block).
+	// `previewArgs` clips a long command with a trailing ellipsis; surface that as
+	// an explicit "(truncated)" note instead.
 	const truncated = argsPreview.endsWith("…");
 	const shownArgs = truncated ? `${argsPreview.slice(0, -1)}...(truncated)` : argsPreview;
-	const title = `${reason}\n\n${toolName}: ${shownArgs}`;
+	const title = opts.hideCall ? reason : `${reason}\n\n${toolName}: ${shownArgs}`;
 
 	const denyIndex = options.indexOf(denyLabel);
 	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends),
@@ -317,6 +319,15 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// The guard only prompts when it could not prove the call safe, so it leans
 		// Deny; a workspace-escape reason yields the directory we can offer to allow.
 		const externalDir = /outside the workspace root: (.+)$/.exec(reason)?.[1];
+		// The host renders `eval` py code as a block above the prompt, so skip the
+		// redundant command line for those.
+		const input = event.input;
+		const hideCall =
+			event.toolName === "eval" &&
+			typeof input === "object" &&
+			input !== null &&
+			"language" in input &&
+			input.language === "py";
 		// The dialog blocks indefinitely: the host pauses the 30s handler budget
 		// while a tool_call dialog is open, so it resolves only when the user
 		// answers or the turn is aborted (ESC / interrupt / shutdown).
@@ -325,6 +336,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				recommendDeny: action.recommend === "deny",
 				externalDir,
 				judge: action.judged && judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
+				hideCall,
 			}),
 		);
 		if (outcome.decision === "allow") {

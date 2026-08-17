@@ -268,4 +268,29 @@ describe("tool_call hook wiring", () => {
 		expect(title).toContain("\n\n"); // blank line between reason and command
 		expect(title).toContain("...(truncated)");
 	});
+
+	test("eval py prompt omits the redundant command line (host renders it)", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let title = "";
+		const capCtx = {
+			...ctx,
+			ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async (t: string) => { title = t; return "Deny"; } },
+		};
+		const { handler } = harness();
+		await handler({ toolName: "eval", input: { language: "py", code: "print(open('/etc/passwd').read())" } }, capCtx);
+		expect(title).not.toContain("eval:"); // no duplicate command line
+		expect(title).not.toContain('"language"');
+	});
+
+	test("eval non-py prompt keeps the command line", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let title = "";
+		const capCtx = {
+			...ctx,
+			ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async (t: string) => { title = t; return "Deny"; } },
+		};
+		const { handler } = harness();
+		await handler({ toolName: "eval", input: { language: "js", code: "fetch('x')" } }, capCtx);
+		expect(title).toContain("eval:");
+	});
 });
