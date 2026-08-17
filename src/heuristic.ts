@@ -350,7 +350,9 @@ function proveBashSafe(
  *
  * - `bash`: `proveBashSafe` (see there) — allow only a flat in-workspace command
  *   with no dangerous effect; uncertain for anything that relocates execution.
- * - `eval`: dangerous-code in any cell → deny; otherwise allow.
+ * - `todo`: session-local task tracker with no fs/exec effect → always allow.
+ * - `eval`: a destructive shell pattern embedded in the code → deny; otherwise
+ *   uncertain (arbitrary unsandboxed code is never provably safe).
  * - `write` / `edit` / `ast_edit` / `tts`: every caller-supplied path proved
  *   in-workspace → allow; a risky one → deny; NO path supplied → uncertain.
  * - `lsp`: read-tier → allow; `request` allowed only for a frozen read-only
@@ -371,12 +373,20 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 			return proveBashSafe(command, rawCwd, ctx, env);
 		}
 		case "eval": {
-			const cells = Array.isArray(record.cells) ? record.cells : [];
-			for (const cell of cells) {
-				const code = asRecord(cell).code;
-				if (typeof code === "string" && containsDangerousCode(code)) {
-					return deny("Detected a potentially destructive command in eval cell code.");
+			// The eval tool passes a single `code` string (batch variants may use a
+			// `cells` array); gather every fragment. A shell-dangerous pattern embedded
+			// in the code (e.g. os.system("rm -rf …")) is a deny; otherwise arbitrary
+			// unsandboxed code cannot be statically proven safe -> uncertain.
+			const fragments: string[] = [];
+			if (typeof record.code === "string") fragments.push(record.code);
+			if (Array.isArray(record.cells)) {
+				for (const cell of record.cells) {
+					const cellCode = asRecord(cell).code;
+					if (typeof cellCode === "string") fragments.push(cellCode);
 				}
+			}
+			if (fragments.some(containsDangerousCode)) {
+				return deny("Detected a potentially destructive command in eval code.");
 			}
 			return uncertain("eval runs arbitrary unsandboxed code and cannot be statically proven workspace-safe");
 		}

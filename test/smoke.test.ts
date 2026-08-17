@@ -74,6 +74,18 @@ describe("classifyHeuristic (other tools)", () => {
 		const input = "[src/a.ts#864C]\nMV ../../../../../../etc/evil.ts";
 		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
 	});
+	test("eval py code embedding a destructive shell command -> deny", () => {
+		const args = { language: "py", title: "cleanup", code: "import os; os.system('rm -rf /tmp/x')" };
+		expect(classifyHeuristic("eval", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("deny");
+	});
+	test("eval py code with no destructive pattern -> uncertain (unsandboxed)", () => {
+		const args = { language: "py", title: "read", code: "print(open('/etc/passwd').read())" };
+		expect(classifyHeuristic("eval", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("uncertain");
+	});
+	test("eval cells variant is still scanned for destructive code -> deny", () => {
+		const args = { cells: [{ code: "git reset --hard HEAD~5" }] };
+		expect(classifyHeuristic("eval", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("deny");
+	});
 });
 
 describe("getToolTier", () => {
