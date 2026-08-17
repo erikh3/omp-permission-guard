@@ -7,7 +7,7 @@
  * modes on top.
  */
 import type { GuardianRequest, GuardianVerdict } from "./guardian";
-import { classifyHeuristic } from "./heuristic";
+import { classifyHeuristic, isProvablySafeHubCall } from "./heuristic";
 import { normalizePolicy, type ToolTier } from "./tier";
 
 export type GuardMode = "heuristic" | "guardian" | "hybrid";
@@ -120,6 +120,9 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 	};
 
 	if (mode === "guardian") {
+		// `hub` is exec-tier, but its coordination/inspection ops carry no host risk;
+		// auto-allow them so the judge is never invoked for benign agent messaging.
+		if (tier === EXEC_TIER && toolName === "hub" && isProvablySafeHubCall(args)) return { action: "allow" };
 		return tier === EXEC_TIER ? runGuardian({}) : { action: "allow" };
 	}
 
