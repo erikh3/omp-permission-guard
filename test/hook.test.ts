@@ -293,4 +293,22 @@ describe("tool_call hook wiring", () => {
 		await handler({ toolName: "eval", input: { language: "js", code: "fetch('x')" } }, capCtx);
 		expect(title).toContain("eval:");
 	});
+
+	test("ask tool is allowed end-to-end (read-tier, never gated)", async () => {
+		process.env.OMP_GUARD_MODE = "guardian"; // even in guardian mode
+		const { handler } = harness();
+		expect(await handler({ toolName: "ask", input: { questions: [] } }, ctx)).toBeUndefined();
+	});
+
+	test("multi-root /add-dir directories are treated as in-workspace", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const mrCtx = {
+			...ctx,
+			sessionManager: { getEntries: () => [], getAdditionalDirectories: () => ["/private/tmp"] },
+			ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async () => "Deny" },
+		};
+		const { handler } = harness();
+		// A call inside an /add-dir root resolves in-workspace -> allowed without prompting.
+		expect(await handler({ toolName: "bash", input: { command: "cd /private/tmp && ls" } }, mrCtx)).toBeUndefined();
+	});
 });

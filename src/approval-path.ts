@@ -28,8 +28,8 @@ export function extractApprovalPath(args: unknown): string {
 /**
  * Extract EVERY target path from `edit`-tool arguments: all `[PATH#TAG]` and
  * legacy `¶PATH#…` headers, all apply-patch `*** Add/Update/Delete File:`
- * sections, all `*** Move to:` / `MV` rename destinations, and the plain `path`
- * field (deduped).
+ * sections, all `*** Move to:` / `MV` rename destinations, patch-mode
+ * `edits[].rename` targets, and the plain `path` field (deduped).
  *
  * `extractApprovalPath` returns only the first path — enough for the approval
  * *prompt* label, but unsafe for a security check: a patch can touch many files
@@ -61,6 +61,17 @@ export function extractAllApprovalPaths(args: unknown): string[] {
 
 	const targetPath = record.path;
 	if (typeof targetPath === "string" && targetPath.length > 0) paths.add(targetPath);
+
+	// Patch mode (`{ path, edits: [{ op?, diff?, rename? }] }`): each edit's
+	// `rename` is a write destination the top-level `path` scan would miss, so a
+	// rename escaping the workspace must be caught here too.
+	if (Array.isArray(record.edits)) {
+		for (const entry of record.edits) {
+			if (entry && typeof entry === "object" && "rename" in entry && typeof entry.rename === "string" && entry.rename.length > 0) {
+				paths.add(entry.rename);
+			}
+		}
+	}
 
 	return [...paths];
 }

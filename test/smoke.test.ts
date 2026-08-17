@@ -9,6 +9,7 @@ import { evaluatePermission } from "../src/evaluate";
 import { classifyHeuristic } from "../src/heuristic";
 import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
+import { extractAllApprovalPaths } from "../src/approval-path";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -86,6 +87,48 @@ describe("classifyHeuristic (other tools)", () => {
 		const args = { cells: [{ code: "git reset --hard HEAD~5" }] };
 		expect(classifyHeuristic("eval", args, { workspaceRoot: WS, tier: "exec" }).decision).toBe("deny");
 	});
+	test("ask tool -> always allow", () => {
+		expect(classifyHeuristic("ask", { questions: [] }, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
+	});
+	test("edit patch-mode rename escaping the workspace -> deny", () => {
+		const args = { path: "src/a.ts", edits: [{ op: "update", rename: "../../../../../../etc/evil.ts" }] };
+		expect(classifyHeuristic("edit", args, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
+	});
+	test("edit [PATH#TAG] with spaces in path -> allow", () => {
+		const input = "[src/my file.ts#864C]\nPUT >1:\n+code";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("allow");
+	});
+	test("edit multi-section: first in-workspace, second escaping -> deny", () => {
+		const input = "[src/good.ts#864C]\nPUT >1:\n+ok\n\n[/etc/passwd#864C]\nPUT >1:\n+evil";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
+	});
+	test("edit apply-patch Add File outside workspace -> deny", () => {
+		const input = "*** Begin Patch\n*** Add File: /etc/shadow\n*** End Patch";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
+	});
+	test("edit apply-patch Move to escape -> deny", () => {
+		const input = "*** Begin Patch\n*** Update File: src/a.ts\n*** Move to: ../../etc/evil.ts\n*** End Patch";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
+	});
+	test("edit legacy ¶ header inside workspace -> allow", () => {
+		const input = "¶src/good.ts#abc\nPUT >1:\n+code";
+		expect(classifyHeuristic("edit", { input }, { workspaceRoot: WS, tier: "write" }).decision).toBe("allow");
+	});
+	test("edit replace-mode plain path field inside workspace -> allow", () => {
+		const args = { path: "src/good.ts", old_string: "x", new_string: "y" };
+		expect(classifyHeuristic("edit", args, { workspaceRoot: WS, tier: "write" }).decision).toBe("allow");
+	});
+	test("edit empty input -> uncertain (no checkable path)", () => {
+		expect(classifyHeuristic("edit", { input: "" }, { workspaceRoot: WS, tier: "write" }).decision).toBe("uncertain");
+	});
+	test("extractAllApprovalPaths: quoted MV dest with # and spaces", () => {
+		const paths = extractAllApprovalPaths({ input: '[src/a.ts#864C]\nMV "../files with # hash.ts"' });
+		expect(paths).toContain("../files with # hash.ts");
+	});
+	test("extractAllApprovalPaths: patch-mode rename destination", () => {
+		const paths = extractAllApprovalPaths({ path: "src/a.ts", edits: [{ rename: "src/b.ts" }] });
+		expect(paths).toContain("src/b.ts");
+	});
 });
 
 describe("getToolTier", () => {
@@ -95,6 +138,8 @@ describe("getToolTier", () => {
 		expect(getToolTier("write", {}, undefined)).toBe("write");
 		expect(getToolTier("mcp__x__y", {}, undefined)).toBe("write");
 		expect(getToolTier("totally_unknown_tool", {}, undefined)).toBe("exec");
+		expect(getToolTier("ask", {}, undefined)).toBe("read");
+		expect(getToolTier("todo", {}, undefined)).toBe("read");
 	});
 	test("live registry tier wins", () => {
 		const tools = [{ name: "custom", approval: "read" }];

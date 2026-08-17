@@ -298,7 +298,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			intent: recentUserIntent(ctx),
 			escalateBlocked: cfg.escalateBlocked !== false,
 			promptOnBlock: cfg.promptOnBlock !== false,
-			allowedRoots: [...sessionAllowedRoots],
+			// Session dir-allow choices + omp's multi-root workspace dirs (`/add-dir`),
+			// both treated as in-workspace by the containment heuristic.
+			allowedRoots: [...sessionAllowedRoots, ...(ctx.sessionManager?.getAdditionalDirectories?.() ?? [])],
 		});
 
 		if (action.action === "allow") {

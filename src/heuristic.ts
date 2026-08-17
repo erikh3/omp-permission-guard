@@ -364,7 +364,9 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 	const record = asRecord(args);
 	switch (toolName) {
 		case "todo":
-			// Session-local task tracker: no filesystem or exec effect, always safe.
+		case "ask":
+			// Session-local tools with no filesystem/exec/network effect (task tracker,
+			// user prompt): always safe.
 			return ALLOW;
 		case "bash": {
 			const command = typeof record.command === "string" ? record.command : "";

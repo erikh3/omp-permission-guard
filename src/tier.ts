@@ -58,6 +58,7 @@ const STATIC_TIERS: Readonly<Record<string, ToolTier>> = {
 	reflect: "read",
 	inspect_image: "read",
 	web_search: "read",
+	ask: "read",
 	write: "write",
 	edit: "write",
 	ast_edit: "write",
