@@ -51,6 +51,7 @@ const STATIC_TIERS: Readonly<Record<string, ToolTier>> = {
 	read: "read",
 	grep: "read",
 	glob: "read",
+	ast_grep: "read",
 	todo: "read",
 	ls: "read",
 	tree: "read",

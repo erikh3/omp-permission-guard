@@ -140,6 +140,7 @@ describe("getToolTier", () => {
 		expect(getToolTier("totally_unknown_tool", {}, undefined)).toBe("exec");
 		expect(getToolTier("ask", {}, undefined)).toBe("read");
 		expect(getToolTier("todo", {}, undefined)).toBe("read");
+		expect(getToolTier("ast_grep", {}, undefined)).toBe("read");
 	});
 	test("live registry tier wins", () => {
 		const tools = [{ name: "custom", approval: "read" }];
