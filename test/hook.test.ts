@@ -24,9 +24,13 @@ function harness() {
 		on: (evt: string, h: Handler) => {
 			if (evt === "tool_call") handler = h;
 		},
+		// The live registry (`getAllToolInfos`) returns approval-less ToolInfo — no
+		// `approval` field — so the guard must lean on its static tier map. Mirror
+		// that here so the test exercises the real classification path.
 		getAllTools: () => [
-			{ name: "bash", approval: () => "exec" },
-			{ name: "read", approval: () => "read" },
+			{ name: "bash", description: "", parameters: {} },
+			{ name: "read", description: "", parameters: {} },
+			{ name: "grep", description: "", parameters: {} },
 		],
 	};
 	permissionGuard(pi as unknown as Parameters<typeof permissionGuard>[0]);
@@ -94,6 +98,47 @@ describe("tool_call hook wiring", () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
 		const { handler } = harness();
 		expect(await handler({ toolName: "read", input: { path: "/etc/passwd" } }, ctx)).toBeUndefined();
+	});
+
+	test("grep inside the workspace -> allowed (undefined), not skipped as read-tier", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		// ctx.cwd is this repo; a relative in-workspace search proves safe.
+		expect(await handler({ toolName: "grep", input: { pattern: "foo", path: "src" } }, ctx)).toBeUndefined();
+	});
+
+	test("grep with no path defaults to the workspace -> allowed", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		expect(await handler({ toolName: "grep", input: { pattern: "foo" } }, ctx)).toBeUndefined();
+	});
+
+	test("grep outside the workspace -> blocked (heuristic denies the escape)", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		const res = await handler({ toolName: "grep", input: { pattern: "x", path: "/etc" } }, ctx);
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("permission-guard");
+	});
+
+	test("grep of a secret/env file inside the workspace -> blocked", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		const res = await handler({ toolName: "grep", input: { pattern: "KEY", path: ".env" } }, ctx);
+		expect(res?.block).toBe(true);
+	});
+
+	test("grep escape prompt title carries the pattern and path", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let title = "";
+		const capCtx = {
+			...ctx,
+			ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async (t: string) => { title = t; return "Deny"; } },
+		};
+		const { handler } = harness();
+		await handler({ toolName: "grep", input: { pattern: "SECRET|token", path: "/var/log" } }, capCtx);
+		expect(title).toContain('pattern "SECRET|token"');
+		expect(title).toContain("/var/log");
 	});
 
 	test("prompt with no selection (cancel) -> blocked", async () => {

@@ -63,6 +63,48 @@ function classifyResolvedPath(resolved: string, root: string, home: string): Ris
 	return null;
 }
 
+/**
+ * Filename patterns for files whose CONTENTS are secret and must not be read
+ * (grepped / catted) even from inside the workspace. Deliberately focused on
+ * credential-bearing files — not a general dotfile denylist — so ordinary
+ * in-workspace source reads are never gated. Matched case-insensitively against
+ * the basename; `.env` and its variants are handled separately (prefix match).
+ */
+const SECRET_FILE_PATTERNS: readonly RegExp[] = [
+	/^\.env(\..+)?$/i, // .env, .env.local, .env.production, …
+	/^\.netrc$/i,
+	/^\.pgpass$/i,
+	/^\.npmrc$/i,
+	/^\.htpasswd$/i,
+	/(^|[._-])secrets?([._-]|$)/i, // secret(s) as a whole word within the name
+	/(^|[._-])credentials?([._-]|$)/i,
+	/^id_(rsa|dsa|ecdsa|ed25519)$/i, // private SSH keys
+	/\.(pem|key|pfx|p12|keystore|jks)$/i, // key material / keystores
+] as const;
+
+/** True when the basename or an enclosing `.ssh` segment marks the path as secret-bearing. */
+function isSecretPath(resolved: string): boolean {
+	const segments = resolved.split(path.sep).filter(Boolean);
+	if (segments.includes(".ssh")) return true;
+	const base = path.basename(resolved);
+	return SECRET_FILE_PATTERNS.some(re => re.test(base));
+}
+
+/**
+ * Classify a READ target (e.g. a `grep` search path). Unlike the write denylist,
+ * a read is unremarkable anywhere inside the workspace — EXCEPT for secret / env
+ * files, whose contents must not be exfiltrated even locally. Returns a reason
+ * when the path is outside the workspace root OR names a secret/env file (so the
+ * caller escalates it), and `null` for an ordinary in-workspace read.
+ */
+export function classifyReadPath(targetPath: string, workspaceRoot: string): string | null {
+	const resolved = resolveWritePath(resolveTargetPath(targetPath, workspaceRoot));
+	const root = realpathOrSelf(path.resolve(workspaceRoot));
+	if (!isPathInside(resolved, root)) return `outside the workspace root: ${resolved}`;
+	if (isSecretPath(resolved)) return `reads a secret or environment file: ${resolved}`;
+	return null;
+}
+
 /** Best-effort realpath of an existing path; returns the input unchanged on failure. */
 export function realpathOrSelf(p: string): string {
 	try {

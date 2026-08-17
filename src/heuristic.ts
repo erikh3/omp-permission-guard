@@ -3,7 +3,7 @@ import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
 import { isInternalUrlPath } from "./path-utils";
-import { classifyRiskyPath, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
+import { classifyReadPath, classifyRiskyPath, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
 /**
@@ -156,6 +156,42 @@ function classifyPathsOrUncertain(paths: string[], ctx: HeuristicContext, label:
 	for (const p of paths) {
 		const reason = riskyPathReason(p, ctx);
 		if (reason) return deny(reason);
+	}
+	return ALLOW;
+}
+
+/** Strip a grep line-range selector (`file.ts:50-100`, `file.ts:raw`) to the bare path. */
+function stripGrepSelector(spec: string): string {
+	// A trailing `:<digits>[-<digits>]` or `:<word>` selector is grep-only sugar,
+	// not part of the filesystem path. Only strip when a `:` follows a real path
+	// body so a Windows-style `C:\…` head (no `/` yet) is left intact.
+	const m = /^(.*[^:]):(?:\d+(?:-\d*)?|raw|conflicts)$/.exec(spec);
+	return m ? m[1]! : spec;
+}
+
+/**
+ * Prove-or-block verdict for a `grep` read. grep is read-tier, but its `path` /
+ * `paths` can point ANYWHERE on disk, so it is exempted from the read-skip and
+ * proved here: a search confined to the workspace (or a session-allowed root) is
+ * allowed, while a path outside the workspace — or one naming a secret/env file
+ * whose contents must not be exfiltrated — is `uncertain` (heuristic denies,
+ * hybrid/guardian escalate to the judge). An ABSENT path defaults to the
+ * workspace root, so it is provably safe → allow. A `;`-delimited list (grep's
+ * multi-root syntax) is split and every root checked.
+ */
+function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext): HeuristicVerdict {
+	const raw = [...stringValues(record.path), ...stringValues(record.paths)];
+	// No path -> grep defaults to the workspace root: provably in-bounds.
+	if (raw.length === 0) return ALLOW;
+	const specs = raw.flatMap(s => s.split(";")).map(s => s.trim()).filter(Boolean);
+	if (specs.length === 0) return ALLOW; // e.g. `path: ""` also defaults to the workspace
+	for (const spec of specs) {
+		if (isInternalUrlPath(spec))
+			return uncertain(`Cannot prove grep internal-URL path stays in workspace: ${spec}`);
+		const target = stripGrepSelector(spec);
+		if (isWithinExtraRoot(target, ctx)) continue;
+		const reason = classifyReadPath(target, ctx.workspaceRoot);
+		if (reason) return uncertain(`grep ${reason}`);
 	}
 	return ALLOW;
 }
@@ -389,7 +425,10 @@ export function isProvablySafeHubCall(args: unknown): boolean {
  *
  * - `bash`: `proveBashSafe` (see there) — allow only a flat in-workspace command
  *   with no dangerous effect; uncertain for anything that relocates execution.
- * - `todo`: session-local task tracker with no fs/exec effect → always allow.
+ * - `todo` / `ask`: session-local tools with no fs/exec effect → always allow.
+ * - `grep`: read-tier but searchable anywhere; a search path inside the workspace
+ *   (or absent → defaults to workspace) → allow; outside it, or naming a
+ *   secret/env file → uncertain (escapes get escalated, never a blind allow).
  * - `eval`: a destructive shell pattern embedded in the code → deny; otherwise
  *   uncertain (arbitrary unsandboxed code is never provably safe).
  * - `write` / `edit` / `ast_edit` / `tts`: every caller-supplied path proved
@@ -410,6 +449,9 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 			// Session-local tools with no filesystem/exec/network effect (task tracker,
 			// user prompt): always safe.
 			return ALLOW;
+		case "grep":
+			// Read-tier, but searchable anywhere on disk -> prove containment.
+			return classifyGrepRead(record, ctx);
 		case "bash": {
 			const command = typeof record.command === "string" ? record.command : "";
 			const rawCwd = typeof record.cwd === "string" && record.cwd.length > 0 ? record.cwd : undefined;

@@ -59,9 +59,26 @@ function loadConfig(logger?: { debug?: (...a: unknown[]) => void }): GuardConfig
 
 /** A short, single-line preview of the tool args for the confirm dialog. */
 function previewArgs(toolName: string, args: unknown): string {
-	if (toolName === "bash" && args && typeof args === "object") {
-		const command = (args as Record<string, unknown>).command;
-		if (typeof command === "string") return command.length > 300 ? `${command.slice(0, 300)}…` : command;
+	if (args && typeof args === "object") {
+		const rec = args as Record<string, unknown>;
+		if (toolName === "bash" && typeof rec.command === "string") {
+			return rec.command.length > 300 ? `${rec.command.slice(0, 300)}…` : rec.command;
+		}
+		if (toolName === "grep") {
+			// The gate on grep is about WHERE it searches, so lead with pattern + path.
+			const pattern = typeof rec.pattern === "string" ? rec.pattern : "";
+			const rawWhere = rec.path ?? rec.paths;
+			const where =
+				typeof rawWhere === "string"
+					? rawWhere
+					: Array.isArray(rawWhere)
+						? rawWhere.filter(v => typeof v === "string").join("; ")
+						: "";
+			if (pattern || where) {
+				const line = where ? `pattern "${pattern}" in ${where}` : `pattern "${pattern}"`;
+				return line.length > 300 ? `${line.slice(0, 300)}…` : line;
+			}
+		}
 	}
 	let text: string;
 	try {
@@ -247,7 +264,10 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		}
 
 		const tier = getToolTier(event.toolName, event.input, tools);
-		if (tier === "read") return; // read-tier tools carry no write/exec risk
+		// Read-tier tools carry no write/exec risk and are skipped — EXCEPT `grep`,
+		// whose `path`/`paths` can read anywhere on disk (secrets, files outside the
+		// workspace). It stays read-tier but is proved by the classifier below.
+		if (tier === "read" && event.toolName !== "grep") return;
 
 		const argsPreview = previewArgs(event.toolName, event.input);
 		const log = (verdict: string, extra?: Record<string, unknown>) =>

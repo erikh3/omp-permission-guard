@@ -90,6 +90,39 @@ describe("classifyHeuristic (other tools)", () => {
 	test("ask tool -> always allow", () => {
 		expect(classifyHeuristic("ask", { questions: [] }, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
 	});
+	const rctx = { workspaceRoot: WS, tier: "read" as const };
+	test("grep with no path -> allow (defaults to workspace)", () => {
+		expect(classifyHeuristic("grep", { pattern: "foo" }, rctx).decision).toBe("allow");
+	});
+	test("grep inside the workspace -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "foo", path: "src" }, rctx).decision).toBe("allow");
+	});
+	test("grep outside the workspace -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "/etc" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep of an env file inside the workspace -> uncertain (secret)", () => {
+		expect(classifyHeuristic("grep", { pattern: "KEY", path: ".env" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep of a private key inside the workspace -> uncertain (secret)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "config/id_rsa" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with a line-range selector inside the workspace -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src/index.ts:1-20" }, rctx).decision).toBe("allow");
+	});
+	test("grep semicolon list with one external root -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src; /etc" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep paths array all in-workspace -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", paths: ["src", "test"] }, rctx).decision).toBe("allow");
+	});
+	test("grep of a session-allowed extra root -> allow", () => {
+		expect(
+			classifyHeuristic("grep", { pattern: "x", path: "/tmp/allowed" }, { ...rctx, extraRoots: ["/tmp/allowed"] }).decision,
+		).toBe("allow");
+	});
+	test("grep internal-URL path -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "artifact://abc" }, rctx).decision).toBe("uncertain");
+	});
 	test("edit patch-mode rename escaping the workspace -> deny", () => {
 		const args = { path: "src/a.ts", edits: [{ op: "update", rename: "../../../../../../etc/evil.ts" }] };
 		expect(classifyHeuristic("edit", args, { workspaceRoot: WS, tier: "write" }).decision).toBe("deny");
@@ -191,9 +224,25 @@ describe("getToolTier", () => {
 		expect(getToolTier("todo", {}, undefined)).toBe("read");
 		expect(getToolTier("ast_grep", {}, undefined)).toBe("read");
 	});
-	test("live registry tier wins", () => {
-		const tools = [{ name: "custom", approval: "read" }];
+	test("live registry approval wins for a non-built-in", () => {
+		const tools = [{ name: "custom", approval: "read" as const }];
 		expect(getToolTier("custom", {}, tools)).toBe("read");
+	});
+	test("built-in static tier beats an approval-less registry entry", () => {
+		// The real registry (getAllToolInfos) strips `approval`; trusting it would
+		// fail-safe every built-in to exec. Static must win so grep/read stay read.
+		const registry = [
+			{ name: "grep", description: "", parameters: {} },
+			{ name: "read", description: "", parameters: {} },
+			{ name: "bash", description: "", parameters: {} },
+		];
+		expect(getToolTier("grep", {}, registry)).toBe("read");
+		expect(getToolTier("read", {}, registry)).toBe("read");
+		expect(getToolTier("bash", {}, registry)).toBe("exec");
+	});
+	test("approval-less non-built-in falls through to exec fail-safe", () => {
+		const registry = [{ name: "some_device", description: "", parameters: {} }];
+		expect(getToolTier("some_device", {}, registry)).toBe("exec");
 	});
 });
 
