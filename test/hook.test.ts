@@ -282,7 +282,7 @@ describe("tool_call hook wiring", () => {
 		expect(title).not.toContain('"language"');
 	});
 
-	test("eval non-py prompt keeps the command line", async () => {
+	test("eval js prompt omits the redundant command line (host renders it)", async () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
 		let title = "";
 		const capCtx = {
@@ -291,7 +291,8 @@ describe("tool_call hook wiring", () => {
 		};
 		const { handler } = harness();
 		await handler({ toolName: "eval", input: { language: "js", code: "fetch('x')" } }, capCtx);
-		expect(title).toContain("eval:");
+		expect(title).not.toContain("eval:"); // no duplicate command line
+		expect(title).not.toContain('"language"');
 	});
 
 	test("ask tool is allowed end-to-end (read-tier, never gated)", async () => {
