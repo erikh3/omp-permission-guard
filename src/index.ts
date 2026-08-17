@@ -323,15 +323,15 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// The guard only prompts when it could not prove the call safe, so it leans
 		// Deny; a workspace-escape reason yields the directory we can offer to allow.
 		const externalDir = /outside the workspace root: (.+)$/.exec(reason)?.[1];
-		// The host renders `eval` py code as a block above the prompt, so skip the
-		// redundant command line for those.
+		// The host renders `eval` code (py or js) as a syntax-highlighted block
+		// above the prompt, so skip the redundant command line for both languages.
 		const input = event.input;
 		const hideCall =
 			event.toolName === "eval" &&
 			typeof input === "object" &&
 			input !== null &&
 			"language" in input &&
-			input.language === "py";
+			(input.language === "py" || input.language === "js");
 		// The dialog blocks indefinitely: the host pauses the 30s handler budget
 		// while a tool_call dialog is open, so it resolves only when the user
 		// answers or the turn is aborted (ESC / interrupt / shutdown).
