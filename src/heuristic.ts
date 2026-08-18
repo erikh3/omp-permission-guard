@@ -3,7 +3,7 @@ import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
 import { isInternalUrlPath, isSessionLocalInternalUrl } from "./path-utils";
-import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
+import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, isSecretReadTarget, realpathOrSelf, resolveTargetPath } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
 /**
@@ -24,10 +24,17 @@ export type HeuristicDecision = "allow" | "deny" | "uncertain";
 export interface HeuristicVerdict {
 	decision: HeuristicDecision;
 	reason?: string;
+	/**
+	 * Set on a `deny` produced by the secret/env-file read gate. The orchestrator
+	 * treats such a deny as hard and non-escalatable — never the guardian, never a
+	 * user prompt — since a secret file must never be exfiltrated.
+	 */
+	secret?: boolean;
 }
 
 const ALLOW: HeuristicVerdict = { decision: "allow" };
 const deny = (reason: string): HeuristicVerdict => ({ decision: "deny", reason });
+const denySecret = (reason: string): HeuristicVerdict => ({ decision: "deny", reason, secret: true });
 const uncertain = (reason: string): HeuristicVerdict => ({ decision: "uncertain", reason });
 
 /** Context required to evaluate path-based heuristics. */
@@ -224,6 +231,10 @@ function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext
 		if (isInternalUrlPath(spec))
 			return uncertain(`Cannot prove grep internal-URL path stays in workspace: ${spec}`);
 		const target = stripGrepSelector(spec);
+		// Secret/env file named directly -> deny before the extra-root/containment allow,
+		// so a secret inside an allowed dir is still refused (marked for the deny-secret policy).
+		if (isSecretReadTarget(target, ctx.workspaceRoot))
+			return denySecret(`grep targets a secret or environment file: ${target}`);
 		if (isWithinExtraRoot(target, ctx)) continue;
 		const reason = classifyReadPath(target, ctx.workspaceRoot);
 		if (reason) return uncertain(`grep ${reason}`);
@@ -232,6 +243,46 @@ function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext
 		if (deliberateReach && (/[*?[]/.test(target) || isDirectoryTarget(target, ctx.workspaceRoot)))
 			return uncertain(`grep with gitignore disabled or hidden files enabled recursively scans a directory that may contain secrets: ${target}`);
 	}
+	return ALLOW;
+}
+
+/**
+ * Prove-or-block verdict for a `read` call. `read` is read-tier and normally
+ * skipped, but its `path` can point ANYWHERE on disk, so it is proved here as an
+ * explicit ordered rule chain:
+ *
+ *   1. SECRET GATE (highest priority): a resolved secret/env file (`.env`,
+ *      `id_rsa`, `*.pem`, anything under `.ssh/`, …) → `deny` marked `secret`.
+ *      This wins over the allowlist below, so a secret inside an allowed external
+ *      dir is still denied, and the orchestrator hard-denies it unconditionally —
+ *      never the guardian, never a user prompt.
+ *   2. IN-WORKSPACE: a non-secret path inside the workspace root → `allow`
+ *      (git-tracked files live here and are covered; no separate git check).
+ *   3. ALLOWLIST: a non-secret path inside a session-allowed extra root
+ *      (`/add-dir` + "allow this directory" choices) → `allow`.
+ *   4/5. Otherwise the read escapes the workspace with no allow → `uncertain`,
+ *      which the orchestrator escalates to the guardian (4) and then the user (5).
+ *
+ * `artifact://`/`agent://` are session-local (no filesystem path) → `allow`;
+ * other internal schemes stay un-provable → `uncertain`. The `:selector` sugar
+ * (`file.ts:50-100`, `:raw`) is stripped before the secret check so `.env:1-5`
+ * cannot slip through on its decorated basename.
+ */
+function classifyFileRead(record: Record<string, unknown>, ctx: HeuristicContext): HeuristicVerdict {
+	const raw = typeof record.path === "string" ? record.path.trim() : "";
+	// Absent/empty path -> the read tool defaults to the workspace root listing; safe.
+	if (!raw) return ALLOW;
+	if (isSessionLocalInternalUrl(raw)) return ALLOW;
+	if (isInternalUrlPath(raw)) return uncertain(`Cannot prove read internal-URL path stays in workspace: ${raw}`);
+	const target = stripGrepSelector(raw);
+	// 1. Secret/env files are denied before any workspace/allowlist allow.
+	if (isSecretReadTarget(target, ctx.workspaceRoot))
+		return denySecret(`read targets a secret or environment file: ${target}`);
+	// 2. In-workspace (non-secret) and 3. session-allowed extra roots are allowed.
+	if (isWithinExtraRoot(target, ctx)) return ALLOW;
+	const reason = classifyReadPath(target, ctx.workspaceRoot);
+	// 4/5. A workspace escape with no allowlist match is unprovable -> escalate.
+	if (reason) return uncertain(`read ${reason}`);
 	return ALLOW;
 }
 
@@ -491,6 +542,9 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 		case "grep":
 			// Read-tier, but searchable anywhere on disk -> prove containment.
 			return classifyGrepRead(record, ctx);
+		case "read":
+			// Read-tier, but readable anywhere on disk -> prove containment + secret-file gate.
+			return classifyFileRead(record, ctx);
 		case "bash": {
 			const command = typeof record.command === "string" ? record.command : "";
 			const rawCwd = typeof record.cwd === "string" && record.cwd.length > 0 ? record.cwd : undefined;

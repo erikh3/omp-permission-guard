@@ -10,7 +10,7 @@ import { classifyHeuristic } from "../src/heuristic";
 import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
 import { extractAllApprovalPaths } from "../src/approval-path";
-import { classifyReadPath, matchWorkspaceEscape } from "../src/risky-paths";
+import { classifyReadPath, isSecretReadTarget, matchWorkspaceEscape } from "../src/risky-paths";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -101,11 +101,13 @@ describe("classifyHeuristic (other tools)", () => {
 	test("grep outside the workspace -> uncertain", () => {
 		expect(classifyHeuristic("grep", { pattern: "x", path: "/etc" }, rctx).decision).toBe("uncertain");
 	});
-	test("grep of an env file inside the workspace -> uncertain (secret)", () => {
-		expect(classifyHeuristic("grep", { pattern: "KEY", path: ".env" }, rctx).decision).toBe("uncertain");
+	test("grep of an env file inside the workspace -> deny (secret)", () => {
+		const v = classifyHeuristic("grep", { pattern: "KEY", path: ".env" }, rctx);
+		expect(v.decision).toBe("deny");
+		expect(v.secret).toBe(true);
 	});
-	test("grep of a private key inside the workspace -> uncertain (secret)", () => {
-		expect(classifyHeuristic("grep", { pattern: "x", path: "config/id_rsa" }, rctx).decision).toBe("uncertain");
+	test("grep of a private key inside the workspace -> deny (secret)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "config/id_rsa" }, rctx).decision).toBe("deny");
 	});
 	test("grep with a line-range selector inside the workspace -> allow", () => {
 		expect(classifyHeuristic("grep", { pattern: "x", path: "src/index.ts:1-20" }, rctx).decision).toBe("allow");
@@ -126,7 +128,7 @@ describe("classifyHeuristic (other tools)", () => {
 	test.each([".env:1-5", ".env.local:raw", "config/id_rsa:10-20", "creds.secret:2-4:raw"])(
 		"grep secret file with a selector %s still gated (selector stripped before secret check)",
 		spec => {
-			expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("uncertain");
+			expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("deny");
 		},
 	);
 	test("grep with hidden:true -> uncertain (deliberate reach)", () => {
@@ -169,6 +171,48 @@ describe("classifyHeuristic (other tools)", () => {
 	});
 	test("grep non-session internal-URL (ssh://) -> uncertain", () => {
 		expect(classifyHeuristic("grep", { pattern: "x", path: "ssh://host/etc" }, rctx).decision).toBe("uncertain");
+	});
+	test("read of a secret file (.env) inside workspace -> deny, marked secret", () => {
+		const v = classifyHeuristic("read", { path: ".env" }, rctx);
+		expect(v.decision).toBe("deny");
+		expect(v.secret).toBe(true);
+	});
+	test("read of .env.local -> deny (secret)", () => {
+		expect(classifyHeuristic("read", { path: "config/.env.local" }, rctx).decision).toBe("deny");
+	});
+	test("read of .env with a line selector -> deny (selector stripped before secret check)", () => {
+		expect(classifyHeuristic("read", { path: ".env:1-5" }, rctx).decision).toBe("deny");
+	});
+	test("read of a private key (id_rsa) -> deny (secret)", () => {
+		expect(classifyHeuristic("read", { path: "id_rsa" }, rctx).decision).toBe("deny");
+	});
+	test("read of a secret file inside an allowed extra root -> still deny (secret wins over allowlist)", () => {
+		const v = classifyHeuristic("read", { path: "/tmp/allowed/.env" }, { ...rctx, extraRoots: ["/tmp/allowed"] });
+		expect(v.decision).toBe("deny");
+		expect(v.secret).toBe(true);
+	});
+	test("read of an ordinary in-workspace source file -> allow (no prompt)", () => {
+		expect(classifyHeuristic("read", { path: "src/index.ts" }, rctx).decision).toBe("allow");
+	});
+	test("read with a line selector on an ordinary file -> allow", () => {
+		expect(classifyHeuristic("read", { path: "src/index.ts:10-20" }, rctx).decision).toBe("allow");
+	});
+	test("read escaping the workspace -> uncertain", () => {
+		expect(classifyHeuristic("read", { path: "/etc/passwd" }, rctx).decision).toBe("uncertain");
+	});
+	test("read absent path (workspace root listing) -> allow", () => {
+		expect(classifyHeuristic("read", {}, rctx).decision).toBe("allow");
+	});
+	test("read session-local artifact:// URL -> allow", () => {
+		expect(classifyHeuristic("read", { path: "artifact://22" }, rctx).decision).toBe("allow");
+	});
+	test("read non-session internal-URL (ssh://) -> uncertain", () => {
+		expect(classifyHeuristic("read", { path: "ssh://host/etc/passwd" }, rctx).decision).toBe("uncertain");
+	});
+	test("read of a session-allowed extra root -> allow", () => {
+		expect(
+			classifyHeuristic("read", { path: "/tmp/allowed/x.txt" }, { ...rctx, extraRoots: ["/tmp/allowed"] }).decision,
+		).toBe("allow");
 	});
 	test("edit patch-mode rename escaping the workspace -> deny", () => {
 		const args = { path: "src/a.ts", edits: [{ op: "update", rename: "../../../../../../etc/evil.ts" }] };
@@ -544,7 +588,7 @@ describe("evaluatePermission (promptOnBlock human override)", () => {
 	});
 });
 
-describe("classifyReadPath (secret files)", () => {
+describe("isSecretReadTarget (secret files)", () => {
 	test.each([
 		".env",
 		".env.local",
@@ -575,8 +619,8 @@ describe("classifyReadPath (secret files)", () => {
 		".envrc",
 		"config/.envrc",
 		".SSH/known_hosts",
-	])("gates secret file %s", p => {
-		expect(classifyReadPath(p, WS)).not.toBeNull();
+	])("flags secret file %s", p => {
+		expect(isSecretReadTarget(p, WS)).toBe(true);
 	});
 
 	test.each([
@@ -595,26 +639,33 @@ describe("classifyReadPath (secret files)", () => {
 		// `key`/`secret`/`credential` as substrings without a boundary/extension are fine.
 		"src/keyboard.ts",
 		"monkey.go",
-	])("allows ordinary in-workspace read %s", p => {
-		expect(classifyReadPath(p, WS)).toBeNull();
-	});
-
-	test("flags an out-of-workspace read", () => {
-		expect(classifyReadPath("/etc/passwd", WS)).toContain("outside the workspace root");
+	])("does not flag ordinary file %s", p => {
+		expect(isSecretReadTarget(p, WS)).toBe(false);
 	});
 
 	test("normalizes path traversal before the secret check", () => {
-		expect(classifyReadPath("src/../.env.production", WS)).toContain("secret or environment file");
+		expect(isSecretReadTarget("src/../.env.production", WS)).toBe(true);
+		expect(isSecretReadTarget("src/../.env", WS)).toBe(true);
 	});
 
-	test("in-workspace secret reason contains 'secret or environment file'", () => {
-		expect(classifyReadPath(".envrc", WS)).toContain("secret or environment file");
-		expect(classifyReadPath("config/.envrc", WS)).toContain("secret or environment file");
-		expect(classifyReadPath("src/../.env", WS)).toContain("secret or environment file");
+	test("flags a secret regardless of the workspace root (out-of-workspace secret)", () => {
+		expect(isSecretReadTarget("/tmp/x/.env", WS)).toBe(true);
+	});
+});
+
+describe("classifyReadPath (workspace containment)", () => {
+	test("allows an ordinary in-workspace read", () => {
+		expect(classifyReadPath("src/index.ts", WS)).toBeNull();
+	});
+	test("flags an out-of-workspace read", () => {
+		expect(classifyReadPath("/etc/passwd", WS)).toContain("outside the workspace root");
+	});
+	test("no longer re-checks secrets (that is isSecretReadTarget's job) -> in-workspace secret is null", () => {
+		expect(classifyReadPath(".env", WS)).toBeNull();
 	});
 
 	test("matchWorkspaceEscape returns undefined for a secret-file reason", () => {
-		expect(matchWorkspaceEscape("reads a secret or environment file: /x/.env")).toBeUndefined();
+		expect(matchWorkspaceEscape("read targets a secret or environment file: /x/.env")).toBeUndefined();
 	});
 
 	test("matchWorkspaceEscape returns the escaped path from an escape reason", () => {
@@ -623,10 +674,9 @@ describe("classifyReadPath (secret files)", () => {
 });
 
 describe("evaluatePermission (grep routing)", () => {
-	const base = { userPolicies: {}, workspaceRoot: WS, hasUI: true } as const;
+	const base = { userPolicies: {}, workspaceRoot: WS, hasUI: true, escalateBlocked: true, promptOnBlock: true } as const;
 	const rTier = "read" as const;
 	const allowGuardian = { evaluate: async () => ({ decision: "allow" as const }) };
-	const denyGuardian = { evaluate: async () => ({ decision: "deny" as const, reason: "no" }) };
 
 	test("guardian mode: in-workspace grep -> allow, spy guardian NOT invoked", async () => {
 		let called = false;
@@ -648,67 +698,233 @@ describe("evaluatePermission (grep routing)", () => {
 		expect(called).toBe(false);
 	});
 
-	test("guardian mode: secret grep + allow-guardian -> allow", async () => {
+	test("secret grep is a hard deny in every mode, and the guardian is NEVER consulted", async () => {
+		let called = false;
+		const spyGuardian = {
+			evaluate: async () => {
+				called = true;
+				return { decision: "allow" as const };
+			},
+		};
+		for (const mode of ["heuristic", "guardian", "hybrid"] as const) {
+			const a = await evaluatePermission({
+				toolName: "grep",
+				args: { pattern: "x", path: ".env" },
+				tier: rTier,
+				mode,
+				guardian: spyGuardian,
+				...base,
+			});
+			expect(a.action).toBe("deny");
+		}
+		expect(called).toBe(false); // secret reads never escalate, even with an allow-guardian
+	});
+
+	test("secret read is a hard deny in every mode, and the guardian is NEVER consulted", async () => {
+		let called = false;
+		const spyGuardian = {
+			evaluate: async () => {
+				called = true;
+				return { decision: "allow" as const };
+			},
+		};
+		for (const mode of ["heuristic", "guardian", "hybrid"] as const) {
+			const a = await evaluatePermission({
+				toolName: "read",
+				args: { path: ".env" },
+				tier: rTier,
+				mode,
+				guardian: spyGuardian,
+				...base,
+			});
+			expect(a.action).toBe("deny");
+		}
+		expect(called).toBe(false);
+	});
+
+	test("secret read hard-denies even headless (no UI) — never a prompt", async () => {
 		const a = await evaluatePermission({
-			toolName: "grep",
-			args: { pattern: "x", path: ".env" },
+			toolName: "read",
+			args: { path: "config/id_rsa" },
 			tier: rTier,
-			mode: "guardian",
+			mode: "hybrid",
 			guardian: allowGuardian,
-			...base,
+			userPolicies: {},
+			workspaceRoot: WS,
+			hasUI: true,
+			promptOnBlock: true,
+			escalateBlocked: true,
+		});
+		expect(a.action).toBe("deny"); // promptOnBlock does not soften a secret deny
+	});
+});
+
+describe("evaluatePermission (secret beats userPolicy allow/prompt)", () => {
+	const rTier = "read" as const;
+	const allowGuardian = { evaluate: async () => ({ decision: "allow" as const }) };
+
+	// (a) userPolicy:allow cannot open a secret file via read or grep — any mode.
+	test.each(["heuristic", "guardian", "hybrid"] as const)(
+		"%s mode: read .env with userPolicy read:allow -> deny",
+		async mode => {
+			const a = await evaluatePermission({
+				toolName: "read",
+				args: { path: ".env" },
+				tier: rTier,
+				mode,
+				userPolicies: { read: "allow" },
+				workspaceRoot: WS,
+				hasUI: true,
+				promptOnBlock: true,
+				guardian: allowGuardian,
+			});
+			expect(a.action).toBe("deny");
+		},
+	);
+
+	test.each(["heuristic", "guardian", "hybrid"] as const)(
+		"%s mode: grep .env with userPolicy grep:allow -> deny",
+		async mode => {
+			const a = await evaluatePermission({
+				toolName: "grep",
+				args: { pattern: "AWS_SECRET", path: ".env" },
+				tier: rTier,
+				mode,
+				userPolicies: { grep: "allow" },
+				workspaceRoot: WS,
+				hasUI: true,
+				promptOnBlock: true,
+				guardian: allowGuardian,
+			});
+			expect(a.action).toBe("deny");
+		},
+	);
+
+	test.each(["heuristic", "guardian", "hybrid"] as const)(
+		"%s mode: read .env with userPolicy read:prompt -> deny (not prompted)",
+		async mode => {
+			const a = await evaluatePermission({
+				toolName: "read",
+				args: { path: ".env" },
+				tier: rTier,
+				mode,
+				userPolicies: { read: "prompt" },
+				workspaceRoot: WS,
+				hasUI: true,
+				promptOnBlock: true,
+				guardian: allowGuardian,
+			});
+			expect(a.action).toBe("deny");
+		},
+	);
+});
+
+describe("evaluatePermission (guardian mode: non-secret escape escalation)", () => {
+	// (b) Guardian mode: a non-secret workspace escape is escalated to the guardian
+	// (blocked===false) — the guardian decides allow/deny, NOT the heuristic alone.
+	test("guardian mode: non-secret /etc/hosts read -> guardian invoked with blocked=false, returns allow", async () => {
+		let capturedBlocked: boolean | undefined;
+		const captureGuardian = {
+			evaluate: async (req: { blocked?: boolean }) => {
+				capturedBlocked = req.blocked;
+				return { decision: "allow" as const };
+			},
+		};
+		const a = await evaluatePermission({
+			toolName: "read",
+			args: { path: "/etc/hosts" },
+			tier: "read" as const,
+			mode: "guardian",
+			userPolicies: {},
+			workspaceRoot: WS,
+			hasUI: true,
+			promptOnBlock: true,
+			escalateBlocked: true,
+			guardian: captureGuardian,
 		});
 		expect(a.action).toBe("allow");
+		expect(capturedBlocked).toBe(false);
 	});
 
-	test("guardian mode: secret grep + deny-guardian + promptOnBlock + UI -> prompt (judged)", async () => {
+	test("guardian mode: non-secret /etc grep -> guardian invoked with blocked=false, returns allow", async () => {
+		let capturedBlocked: boolean | undefined;
+		const captureGuardian = {
+			evaluate: async (req: { blocked?: boolean }) => {
+				capturedBlocked = req.blocked;
+				return { decision: "allow" as const };
+			},
+		};
 		const a = await evaluatePermission({
 			toolName: "grep",
-			args: { pattern: "x", path: ".env" },
-			tier: rTier,
+			args: { pattern: "localhost", path: "/etc" },
+			tier: "read" as const,
 			mode: "guardian",
-			guardian: denyGuardian,
+			userPolicies: {},
+			workspaceRoot: WS,
+			hasUI: true,
 			promptOnBlock: true,
-			...base,
+			escalateBlocked: true,
+			guardian: captureGuardian,
 		});
-		expect(a.action).toBe("prompt");
-		expect(a.action === "prompt" && a.judged === true).toBe(true);
+		expect(a.action).toBe("allow");
+		expect(capturedBlocked).toBe(false);
 	});
+});
 
-	test("guardian mode: secret grep + deny-guardian + hasUI:false -> deny", async () => {
+describe("evaluatePermission (secret hard-deny: headless and UI cases)", () => {
+	const rTier = "read" as const;
+	const allowGuardian = { evaluate: async () => ({ decision: "allow" as const }) };
+
+	// (c) Headless secret: hasUI:false must still hard-deny.
+	test("secret read hard-denies when hasUI=false (headless)", async () => {
 		const a = await evaluatePermission({
-			toolName: "grep",
-			args: { pattern: "x", path: ".env" },
+			toolName: "read",
+			args: { path: "config/id_rsa" },
 			tier: rTier,
-			mode: "guardian",
-			guardian: denyGuardian,
-			promptOnBlock: true,
+			mode: "hybrid",
+			guardian: allowGuardian,
 			userPolicies: {},
 			workspaceRoot: WS,
 			hasUI: false,
+			promptOnBlock: true,
+			escalateBlocked: true,
 		});
 		expect(a.action).toBe("deny");
 	});
 
-	test("hybrid mode: secret grep + allow-guardian -> allow", async () => {
+	// promptOnBlock + UI also cannot soften a secret deny.
+	test("secret read hard-denies even with promptOnBlock + UI — never a prompt", async () => {
 		const a = await evaluatePermission({
-			toolName: "grep",
-			args: { pattern: "x", path: ".env" },
+			toolName: "read",
+			args: { path: "config/id_rsa" },
 			tier: rTier,
 			mode: "hybrid",
 			guardian: allowGuardian,
-			...base,
+			userPolicies: {},
+			workspaceRoot: WS,
+			hasUI: true,
+			promptOnBlock: true,
+			escalateBlocked: true,
 		});
-		expect(a.action).toBe("allow");
+		expect(a.action).toBe("deny");
 	});
+});
 
-	test("hybrid mode: secret grep + no guardian + hasUI -> prompt (fail-safe)", async () => {
-		const a = await evaluatePermission({
-			toolName: "grep",
-			args: { pattern: "x", path: ".env" },
-			tier: rTier,
-			mode: "hybrid",
-			...base,
-		});
-		expect(a.action).toBe("prompt");
+describe("isSecretReadTarget (.aws and .gnupg dir segments)", () => {
+	// (d) New secret directory segments must be gated.
+	test("flags .aws/config as secret", () => {
+		expect(isSecretReadTarget(".aws/config", WS)).toBe(true);
+	});
+	test("flags .aws/credentials as secret", () => {
+		expect(isSecretReadTarget(".aws/credentials", WS)).toBe(true);
+	});
+	test("flags .gnupg/gpg.conf as secret", () => {
+		expect(isSecretReadTarget(".gnupg/gpg.conf", WS)).toBe(true);
+	});
+	test("flags .AWS/config (case-insensitive) as secret", () => {
+		expect(isSecretReadTarget(".AWS/config", WS)).toBe(true);
+	});
+	test("does not flag an ordinary src file as secret", () => {
+		expect(isSecretReadTarget("src/config.ts", WS)).toBe(false);
 	});
 });

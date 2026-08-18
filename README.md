@@ -45,6 +45,7 @@ An **explicit user request wins**, without opening a prompt-injection hole:
   "maxAttempts": 3,
   "escalateBlocked": true,
   "promptOnBlock": true,
+  "readOmpConfig": true,
   "approval": { "bash": "prompt" }
 }
 ```
@@ -55,11 +56,12 @@ An **explicit user request wins**, without opening a prompt-injection hole:
 - `escalateBlocked` — hybrid only: escalate a heuristic-blocked exec call to the guardian so it can allow an explicitly user-requested action (upgrade-only). Default `true`; set `false` for strict prove-or-block.
 - `promptOnBlock` — when a UI exists, surface a confirm dialog instead of a hard block so you can override; headless runs still hard-deny. Default `true`; set `false` for a hard wall even interactively.
 - `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks.
+- `readOmpConfig` — also read omp's own `tools.approval` allow-list from `config.yml` and apply it under this file's `approval` (which wins on conflict). Default `true`; set `false` to ignore omp's list. See [Reading omp's approval list](#reading-omps-approval-list).
 
-Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session. When a call needs confirmation, the guard pauses the agent (the streaming spinner switches to "waiting for you to approve …") and shows a selector:
+Runtime: `/guard status` shows the mode plus how many calls are allowed this session; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session; `/guard allowed` and `/guard revoke <call>` manage the session allow-list (see below). When a call needs confirmation, the guard pauses the agent (the streaming spinner switches to "waiting for you to approve …") and shows a selector:
 
 - **Allow once** — run this call now.
-- **Allow this exact call this session** — skip the prompt for an identical call until you restart or `/guard off`.
+- **Allow this exact call this session** — skip the prompt for an identical call until you restart or `/guard off`. Identity is the tool plus its safety-relevant arguments; volatile fields the agent varies between otherwise-identical calls (e.g. bash's `timeout`) are ignored, so the same command is not re-prompted just because its timeout changed.
 - **Allow the directory `<dir>` this session** — shown only when the call was blocked for escaping the workspace root; whitelists that directory for the rest of the session so calls under it stop prompting.
 - **Deny** — block and tell the agent it was refused. The guard only prompts when it could not prove the call safe, so Deny is **pre-selected**.
 - **Deny (type your own)** — block and type a message that is forwarded to the agent verbatim.
@@ -67,6 +69,23 @@ Runtime: `/guard status` shows the mode; `/guard hybrid` (or `off`/`heuristic`/`
 The dialog waits until you choose (ESC denies). When the guardian model produced the ruling behind a prompt (a guardian **deny** in guardian/hybrid mode), the footer names the judging model and its self-reported confidence (e.g. `↳ judged by <model> (confidence 0.9)`); heuristic blocks, fail-safes, and declined escalations show no judge (the model did not rule).
 
 The "this session" choices (allow this exact call, allow the directory) are held in memory for the running session only — they are never written to `permission-guard.json` and are cleared on restart. For a persistent rule, add an `approval` entry (e.g. `"bash": "allow"`) to the config file instead.
+
+**Managing the session allow-list:** `/guard allowed` opens a scrollable selector of every call allowed this session, sorted by when you allowed it (last added at the bottom); pick one to revoke it immediately (it will prompt again next time). `/guard revoke <call>` removes a specific entry directly — its argument autocompletes from the current allow-list, so you can type-to-filter like `/add-dir`. Both are session-only and need no restart.
+
+### Reading omp's approval list
+
+With `readOmpConfig` (default `true`), the guard also reads omp's own `tools.approval` map from `config.yml` and treats each entry as an authoritative policy, exactly like its own `approval` map. A tool with a matching rule is allowed / denied / prompted directly; a tool with **no** matching rule falls through to the normal tier → heuristic → guardian flow.
+
+This is what makes the [recommended pairing](#recommended-pairing) work end to end: under core `tools.approvalMode: yolo`, core stops consulting its own `tools.approval` allow-list, so the guard picks it up and keeps honoring it.
+
+Which files are read: the active agent directory's `config.yml` (profile-aware — `--profile`, `PI_CODING_AGENT_DIR`, and `PI_CONFIG_DIR` are honored) and the project `<cwd>/.omp/config.yml`, with the project layer overriding the global one. Your own `permission-guard.json` `approval` entry overrides both.
+
+**Limitations:**
+
+- **Exact tool names only.** Any `tools.approval` key containing a glob metacharacter (`* ? [ ] { }`) is skipped. There is no wildcard matching.
+- **`bash.patterns` are not read** — they are glob-based, so they fall under the wildcard limitation above.
+- **Config overlays are not reflected.** `--config` and `PI_CONFIG_FILES` overlays are ignored; only the global and project `config.yml` files are read.
+- **XDG path relocation is not handled** (`$XDG_*_HOME/omp`).
 
 ## Debugging
 
