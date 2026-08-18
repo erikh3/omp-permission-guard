@@ -160,13 +160,25 @@ function classifyPathsOrUncertain(paths: string[], ctx: HeuristicContext, label:
 	return ALLOW;
 }
 
-/** Strip a grep line-range selector (`file.ts:50-100`, `file.ts:raw`) to the bare path. */
+/**
+ * Strip grep's line-range / mode selector(s) from a path spec, leaving the bare
+ * filesystem path. Selectors are `:`-suffixes that are grep sugar, not part of
+ * the path: a range list (`:50`, `:50-200`, `:50-`, `:50+150`, `:5-16,960-973`)
+ * or a mode keyword (`:raw`, `:conflicts`), and they CHAIN in either order
+ * (`:2-4:raw`, `:raw:2-4`). Stripping is load-bearing for safety: an unstripped
+ * `.env:1-5` would leave basename `.env:1-5`, defeating the secret-file check and
+ * silently allowing the read. A `:` NOT followed by a range/keyword (a Windows
+ * `C:\…` head, an odd filename) is left intact — only recognized selectors peel.
+ */
+const GREP_SELECTOR = /:(?:raw|conflicts|\d+(?:-\d*|\+\d+)?(?:,\d+(?:-\d*|\+\d+)?)*)$/;
 function stripGrepSelector(spec: string): string {
-	// A trailing `:<digits>[-<digits>]` or `:<word>` selector is grep-only sugar,
-	// not part of the filesystem path. Only strip when a `:` follows a real path
-	// body so a Windows-style `C:\…` head (no `/` yet) is left intact.
-	const m = /^(.*[^:]):(?:\d+(?:-\d*)?|raw|conflicts)$/.exec(spec);
-	return m ? m[1]! : spec;
+	let s = spec;
+	for (;;) {
+		const next = s.replace(GREP_SELECTOR, "");
+		if (next === s || next === "") break; // no selector left, or the whole spec was one
+		s = next;
+	}
+	return s;
 }
 
 /**

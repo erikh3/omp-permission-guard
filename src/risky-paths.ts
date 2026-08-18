@@ -78,8 +78,13 @@ const SECRET_FILE_PATTERNS: readonly RegExp[] = [
 	/^\.htpasswd$/i,
 	/(^|[._-])secrets?([._-]|$)/i, // secret(s) as a whole word within the name
 	/(^|[._-])credentials?([._-]|$)/i,
+	/^\.tokens?([._-].*)?$/i, // leading-dot token file: .token, .tokens, .tokens.json, .token-old
 	/^id_(rsa|dsa|ecdsa|ed25519)$/i, // private SSH keys
-	/\.(pem|key|pfx|p12|keystore|jks)$/i, // key material / keystores
+	// Extension / keystore forms. `token`/`tokens` as an EXTENSION only (`gh.token`,
+	// `x.tokens`) — deliberately NOT a whole-word match, which would gate ordinary
+	// source like `token.ts`, `tokens.py`, `token-utils.ts` and cripple grep on
+	// any lexer/parser codebase.
+	/\.(pem|key|pfx|p12|keystore|jks|token|tokens)$/i,
 ] as const;
 
 /** True when the basename or an enclosing `.ssh` segment marks the path as secret-bearing. */

@@ -10,6 +10,7 @@ import { classifyHeuristic } from "../src/heuristic";
 import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
 import { extractAllApprovalPaths } from "../src/approval-path";
+import { classifyReadPath } from "../src/risky-paths";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -109,6 +110,25 @@ describe("classifyHeuristic (other tools)", () => {
 	test("grep with a line-range selector inside the workspace -> allow", () => {
 		expect(classifyHeuristic("grep", { pattern: "x", path: "src/index.ts:1-20" }, rctx).decision).toBe("allow");
 	});
+	test.each([
+		"src/index.ts:50",
+		"src/index.ts:50-200",
+		"src/index.ts:50-",
+		"src/index.ts:50+150",
+		"src/index.ts:5-16,960-973",
+		"src/index.ts:raw",
+		"src/index.ts:conflicts",
+		"src/index.ts:2-4:raw",
+		"src/index.ts:raw:2-4",
+	])("grep selector %s is stripped -> in-workspace allow", spec => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("allow");
+	});
+	test.each([".env:1-5", ".env.local:raw", "config/id_rsa:10-20", "creds.secret:2-4:raw"])(
+		"grep secret file with a selector %s still gated (selector stripped before secret check)",
+		spec => {
+			expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("uncertain");
+		},
+	);
 	test("grep semicolon list with one external root -> uncertain", () => {
 		expect(classifyHeuristic("grep", { pattern: "x", path: "src; /etc" }, rctx).decision).toBe("uncertain");
 	});
@@ -494,5 +514,66 @@ describe("evaluatePermission (promptOnBlock human override)", () => {
 		const conf = { evaluate: async () => ({ decision: "deny" as const, reason: "no", confidence: 0.9 }) };
 		const a = await evaluatePermission({ ...CRIT, mode: "guardian", guardian: conf, promptOnBlock: true, ...base });
 		expect(a.action === "prompt" && a.confidence).toBe(0.9);
+	});
+});
+
+describe("classifyReadPath (secret files)", () => {
+	test.each([
+		".env",
+		".env.local",
+		".env.production",
+		".netrc",
+		".pgpass",
+		".npmrc",
+		".htpasswd",
+		"config/id_rsa",
+		"keys/id_ed25519",
+		"certs/server.pem",
+		"certs/client.key",
+		"store.keystore",
+		"app.jks",
+		"my.pfx",
+		"vault.p12",
+		"app.token",
+		"gh.token",
+		"x.tokens",
+		".token",
+		".tokens",
+		".tokens.json",
+		".token-old",
+		"creds.secret",
+		"aws-credentials.ini",
+		"my-credentials.yaml",
+		"a/b/.ssh/known_hosts",
+	])("gates secret file %s", p => {
+		expect(classifyReadPath(p, WS)).not.toBeNull();
+	});
+
+	test.each([
+		"src/index.ts",
+		"package.json",
+		".gitignore",
+		"README.md",
+		// `token`/`tokens` as ordinary source words must NOT be gated (extension-only match).
+		"src/token.ts",
+		"lexer/tokens.py",
+		"src/token-utils.ts",
+		"parser/token_stream.rs",
+		"Tokenizer.java",
+		"retokenize.js",
+		"brokentoken.md",
+		// `key`/`secret`/`credential` as substrings without a boundary/extension are fine.
+		"src/keyboard.ts",
+		"monkey.go",
+	])("allows ordinary in-workspace read %s", p => {
+		expect(classifyReadPath(p, WS)).toBeNull();
+	});
+
+	test("flags an out-of-workspace read", () => {
+		expect(classifyReadPath("/etc/passwd", WS)).toContain("outside the workspace root");
+	});
+
+	test("normalizes path traversal before the secret check", () => {
+		expect(classifyReadPath("src/../.env.production", WS)).toContain("secret or environment file");
 	});
 });
