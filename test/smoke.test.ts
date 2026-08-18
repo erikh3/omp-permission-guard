@@ -10,6 +10,7 @@ import { classifyHeuristic } from "../src/heuristic";
 import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
 import { extractAllApprovalPaths } from "../src/approval-path";
+import { classifyReadPath, matchWorkspaceEscape } from "../src/risky-paths";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -89,6 +90,79 @@ describe("classifyHeuristic (other tools)", () => {
 	});
 	test("ask tool -> always allow", () => {
 		expect(classifyHeuristic("ask", { questions: [] }, { workspaceRoot: WS, tier: "exec" }).decision).toBe("allow");
+	});
+	const rctx = { workspaceRoot: WS, tier: "read" as const };
+	test("grep with no path -> allow (defaults to workspace)", () => {
+		expect(classifyHeuristic("grep", { pattern: "foo" }, rctx).decision).toBe("allow");
+	});
+	test("grep inside the workspace -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "foo", path: "src" }, rctx).decision).toBe("allow");
+	});
+	test("grep outside the workspace -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "/etc" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep of an env file inside the workspace -> uncertain (secret)", () => {
+		expect(classifyHeuristic("grep", { pattern: "KEY", path: ".env" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep of a private key inside the workspace -> uncertain (secret)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "config/id_rsa" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with a line-range selector inside the workspace -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src/index.ts:1-20" }, rctx).decision).toBe("allow");
+	});
+	test.each([
+		"src/index.ts:50",
+		"src/index.ts:50-200",
+		"src/index.ts:50-",
+		"src/index.ts:50+150",
+		"src/index.ts:5-16,960-973",
+		"src/index.ts:raw",
+		"src/index.ts:conflicts",
+		"src/index.ts:2-4:raw",
+		"src/index.ts:raw:2-4",
+	])("grep selector %s is stripped -> in-workspace allow", spec => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("allow");
+	});
+	test.each([".env:1-5", ".env.local:raw", "config/id_rsa:10-20", "creds.secret:2-4:raw"])(
+		"grep secret file with a selector %s still gated (selector stripped before secret check)",
+		spec => {
+			expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("uncertain");
+		},
+	);
+	test("grep with hidden:true -> uncertain (deliberate reach)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src", hidden: true }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with gitignore:false and path -> uncertain (deliberate reach)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: ".", gitignore: false }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with gitignore:false and absent path -> uncertain (deliberate reach)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", gitignore: false }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with no flags and in-workspace path -> allow (low-noise contract)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src" }, rctx).decision).toBe("allow");
+	});
+	test("grep with no flags and absent path -> allow (low-noise contract)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x" }, rctx).decision).toBe("allow");
+	});
+	test("grep non-selector colon path inside workspace -> allow (colon not stripped)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src/a:b" }, rctx).decision).toBe("allow");
+	});
+	test("grep non-selector colon path outside workspace -> uncertain (escape survives colon)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "/etc/x:y" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep semicolon list with one external root -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src; /etc" }, rctx).decision).toBe("uncertain");
+	});
+	test("grep paths array all in-workspace -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", paths: ["src", "test"] }, rctx).decision).toBe("allow");
+	});
+	test("grep of a session-allowed extra root -> allow", () => {
+		expect(
+			classifyHeuristic("grep", { pattern: "x", path: "/tmp/allowed" }, { ...rctx, extraRoots: ["/tmp/allowed"] }).decision,
+		).toBe("allow");
+	});
+	test("grep internal-URL path -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "artifact://abc" }, rctx).decision).toBe("uncertain");
 	});
 	test("edit patch-mode rename escaping the workspace -> deny", () => {
 		const args = { path: "src/a.ts", edits: [{ op: "update", rename: "../../../../../../etc/evil.ts" }] };
@@ -191,9 +265,25 @@ describe("getToolTier", () => {
 		expect(getToolTier("todo", {}, undefined)).toBe("read");
 		expect(getToolTier("ast_grep", {}, undefined)).toBe("read");
 	});
-	test("live registry tier wins", () => {
-		const tools = [{ name: "custom", approval: "read" }];
+	test("live registry approval wins for a non-built-in", () => {
+		const tools = [{ name: "custom", approval: "read" as const }];
 		expect(getToolTier("custom", {}, tools)).toBe("read");
+	});
+	test("built-in static tier beats an approval-less registry entry", () => {
+		// The real registry (getAllToolInfos) strips `approval`; trusting it would
+		// fail-safe every built-in to exec. Static must win so grep/read stay read.
+		const registry = [
+			{ name: "grep", description: "", parameters: {} },
+			{ name: "read", description: "", parameters: {} },
+			{ name: "bash", description: "", parameters: {} },
+		];
+		expect(getToolTier("grep", {}, registry)).toBe("read");
+		expect(getToolTier("read", {}, registry)).toBe("read");
+		expect(getToolTier("bash", {}, registry)).toBe("exec");
+	});
+	test("approval-less non-built-in falls through to exec fail-safe", () => {
+		const registry = [{ name: "some_device", description: "", parameters: {} }];
+		expect(getToolTier("some_device", {}, registry)).toBe("exec");
 	});
 });
 
@@ -445,5 +535,174 @@ describe("evaluatePermission (promptOnBlock human override)", () => {
 		const conf = { evaluate: async () => ({ decision: "deny" as const, reason: "no", confidence: 0.9 }) };
 		const a = await evaluatePermission({ ...CRIT, mode: "guardian", guardian: conf, promptOnBlock: true, ...base });
 		expect(a.action === "prompt" && a.confidence).toBe(0.9);
+	});
+});
+
+describe("classifyReadPath (secret files)", () => {
+	test.each([
+		".env",
+		".env.local",
+		".env.production",
+		".netrc",
+		".pgpass",
+		".npmrc",
+		".htpasswd",
+		"config/id_rsa",
+		"keys/id_ed25519",
+		"certs/server.pem",
+		"certs/client.key",
+		"store.keystore",
+		"app.jks",
+		"my.pfx",
+		"vault.p12",
+		"app.token",
+		"gh.token",
+		"x.tokens",
+		".token",
+		".tokens",
+		".tokens.json",
+		".token-old",
+		"creds.secret",
+		"aws-credentials.ini",
+		"my-credentials.yaml",
+		"a/b/.ssh/known_hosts",
+		".envrc",
+		"config/.envrc",
+		".SSH/known_hosts",
+	])("gates secret file %s", p => {
+		expect(classifyReadPath(p, WS)).not.toBeNull();
+	});
+
+	test.each([
+		"src/index.ts",
+		"package.json",
+		".gitignore",
+		"README.md",
+		// `token`/`tokens` as ordinary source words must NOT be gated (extension-only match).
+		"src/token.ts",
+		"lexer/tokens.py",
+		"src/token-utils.ts",
+		"parser/token_stream.rs",
+		"Tokenizer.java",
+		"retokenize.js",
+		"brokentoken.md",
+		// `key`/`secret`/`credential` as substrings without a boundary/extension are fine.
+		"src/keyboard.ts",
+		"monkey.go",
+	])("allows ordinary in-workspace read %s", p => {
+		expect(classifyReadPath(p, WS)).toBeNull();
+	});
+
+	test("flags an out-of-workspace read", () => {
+		expect(classifyReadPath("/etc/passwd", WS)).toContain("outside the workspace root");
+	});
+
+	test("normalizes path traversal before the secret check", () => {
+		expect(classifyReadPath("src/../.env.production", WS)).toContain("secret or environment file");
+	});
+
+	test("in-workspace secret reason contains 'secret or environment file'", () => {
+		expect(classifyReadPath(".envrc", WS)).toContain("secret or environment file");
+		expect(classifyReadPath("config/.envrc", WS)).toContain("secret or environment file");
+		expect(classifyReadPath("src/../.env", WS)).toContain("secret or environment file");
+	});
+
+	test("matchWorkspaceEscape returns undefined for a secret-file reason", () => {
+		expect(matchWorkspaceEscape("reads a secret or environment file: /x/.env")).toBeUndefined();
+	});
+
+	test("matchWorkspaceEscape returns the escaped path from an escape reason", () => {
+		expect(matchWorkspaceEscape("grep outside the workspace root: /etc/passwd")).toBe("/etc/passwd");
+	});
+});
+
+describe("evaluatePermission (grep routing)", () => {
+	const base = { userPolicies: {}, workspaceRoot: WS, hasUI: true } as const;
+	const rTier = "read" as const;
+	const allowGuardian = { evaluate: async () => ({ decision: "allow" as const }) };
+	const denyGuardian = { evaluate: async () => ({ decision: "deny" as const, reason: "no" }) };
+
+	test("guardian mode: in-workspace grep -> allow, spy guardian NOT invoked", async () => {
+		let called = false;
+		const spyGuardian = {
+			evaluate: async () => {
+				called = true;
+				throw new Error("guardian should not be invoked for safe grep");
+			},
+		};
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: "src" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: spyGuardian,
+			...base,
+		});
+		expect(a.action).toBe("allow");
+		expect(called).toBe(false);
+	});
+
+	test("guardian mode: secret grep + allow-guardian -> allow", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: allowGuardian,
+			...base,
+		});
+		expect(a.action).toBe("allow");
+	});
+
+	test("guardian mode: secret grep + deny-guardian + promptOnBlock + UI -> prompt (judged)", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: denyGuardian,
+			promptOnBlock: true,
+			...base,
+		});
+		expect(a.action).toBe("prompt");
+		expect(a.action === "prompt" && a.judged === true).toBe(true);
+	});
+
+	test("guardian mode: secret grep + deny-guardian + hasUI:false -> deny", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: denyGuardian,
+			promptOnBlock: true,
+			userPolicies: {},
+			workspaceRoot: WS,
+			hasUI: false,
+		});
+		expect(a.action).toBe("deny");
+	});
+
+	test("hybrid mode: secret grep + allow-guardian -> allow", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "hybrid",
+			guardian: allowGuardian,
+			...base,
+		});
+		expect(a.action).toBe("allow");
+	});
+
+	test("hybrid mode: secret grep + no guardian + hasUI -> prompt (fail-safe)", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "hybrid",
+			...base,
+		});
+		expect(a.action).toBe("prompt");
 	});
 });

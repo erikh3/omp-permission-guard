@@ -84,18 +84,27 @@ const STATIC_TIERS: Readonly<Record<string, ToolTier>> = {
 };
 
 /**
- * Effective tier for a tool call. Prefers the live tool registry's declared
- * tier (authoritative, covers xd/MCP tools), falls back to the static map, then
- * to `mcp__*` → write, and finally `exec` (fail safe).
+ * Effective tier for a tool call. A known built-in's static tier wins (the live
+ * registry strips `approval`, so trusting it for built-ins would fail-safe every
+ * one to `exec`); otherwise a non-built-in with an `approval` declaration reports
+ * its own tier (covers xd/SDK devices), then `mcp__*` → write, then `exec`.
  */
 export function getToolTier(
 	toolName: string,
 	args: unknown,
 	tools: readonly ApprovalSubject[] | undefined,
 ): ToolTier {
-	const tool = tools?.find(t => t.name === toolName);
-	if (tool) return resolveToolTier(tool, args);
+	// A known built-in's static tier is authoritative. The live tool registry's
+	// `ToolInfo` (from `getAllToolInfos`) does NOT carry the `approval` field, so
+	// consulting it for a built-in would resolve `undefined` → the `exec` fail-safe
+	// for EVERY built-in (grep/read/glob/ast_grep/web_search included), gating
+	// harmless read-tier tools. Static first keeps them correctly classified.
 	if (Object.hasOwn(STATIC_TIERS, toolName)) return STATIC_TIERS[toolName]!;
+	// A non-built-in that actually exposes an `approval` declaration (an SDK/xd
+	// device tool) is trusted to report its own tier; argument-dependent devices
+	// resolve per-call. Registry entries without `approval` fall through.
+	const tool = tools?.find(t => t.name === toolName);
+	if (tool && tool.approval !== undefined) return resolveToolTier(tool, args);
 	if (toolName.startsWith("mcp__")) return "write";
 	return "exec";
 }

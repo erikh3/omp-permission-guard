@@ -3,7 +3,7 @@ import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
 import { isInternalUrlPath } from "./path-utils";
-import { classifyRiskyPath, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
+import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
 /**
@@ -156,6 +156,76 @@ function classifyPathsOrUncertain(paths: string[], ctx: HeuristicContext, label:
 	for (const p of paths) {
 		const reason = riskyPathReason(p, ctx);
 		if (reason) return deny(reason);
+	}
+	return ALLOW;
+}
+
+/**
+ * Strip grep's line-range / mode selector(s) from a path spec, leaving the bare
+ * filesystem path. Selectors are `:`-suffixes that are grep sugar, not part of
+ * the path: a range list (`:50`, `:50-200`, `:50-`, `:50+150`, `:5-16,960-973`)
+ * or a mode keyword (`:raw`, `:conflicts`), and they CHAIN in either order
+ * (`:2-4:raw`, `:raw:2-4`). Stripping is load-bearing for safety: an unstripped
+ * `.env:1-5` would leave basename `.env:1-5`, defeating the secret-file check and
+ * silently allowing the read. A `:` NOT followed by a range/keyword (a Windows
+ * `C:\…` head, an odd filename) is left intact — only recognized selectors peel.
+ */
+const GREP_SELECTOR = /:(?:raw|conflicts|\d+(?:-\d*|\+\d+)?(?:,\d+(?:-\d*|\+\d+)?)*)$/;
+function stripGrepSelector(spec: string): string {
+	let s = spec;
+	for (;;) {
+		const next = s.replace(GREP_SELECTOR, "");
+		if (next === s || next === "") break; // no selector left, or the whole spec was one
+		s = next;
+	}
+	return s;
+}
+
+/**
+ * Prove-or-block verdict for a `grep` read. grep is read-tier, but its `path` /
+ * `paths` can point ANYWHERE on disk, so it is exempted from the read-skip and
+ * proved here. Two independent gates apply:
+ *
+ * 1. DIRECT-NAME gate (always active): a path that names a secret/env file or
+ *    escapes the workspace → `uncertain`. This fires regardless of flags.
+ *
+ * 2. RECURSIVE-REACH gate (deliberate-reach only): when `gitignore === false` or
+ *    `hidden === true` the caller is deliberately reaching into ignored/hidden
+ *    directories where secrets like `.env`, `id_rsa`, and `*.pem` live. Under
+ *    those flags a directory or glob target can recurse into secret files whose
+ *    basenames the direct-name gate never sees → `uncertain`. Under the default
+ *    flags gitignore and hidden-file exclusion strip those files automatically,
+ *    so a plain directory target (`{path:"src"}`) is safe → `allow`.
+ *
+ * An ABSENT or empty path defaults to the workspace root. Under default flags
+ * that is provably safe → `allow`. Under deliberate-reach flags the whole tree
+ * is in scope but no single provably-secret basename is targeted, so the risk
+ * cannot be proven or disproven → `uncertain`.
+ *
+ * A `;`-delimited list (grep's multi-root syntax) is split and every spec is
+ * checked independently; the first failing spec short-circuits.
+ */
+function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext): HeuristicVerdict {
+	const deliberateReach = record.gitignore === false || record.hidden === true;
+	const raw = [...stringValues(record.path), ...stringValues(record.paths)];
+	const specs = raw.flatMap(s => s.split(";")).map(s => s.trim()).filter(Boolean);
+	// Absent/empty path -> whole workspace. Safe under default gitignore; a deliberate
+	// reach into ignored/hidden files across the whole tree is not provable -> uncertain.
+	if (specs.length === 0)
+		return deliberateReach
+			? uncertain("grep with gitignore disabled or hidden files enabled scans ignored/hidden files that may hold secrets")
+			: ALLOW;
+	for (const spec of specs) {
+		if (isInternalUrlPath(spec))
+			return uncertain(`Cannot prove grep internal-URL path stays in workspace: ${spec}`);
+		const target = stripGrepSelector(spec);
+		if (isWithinExtraRoot(target, ctx)) continue;
+		const reason = classifyReadPath(target, ctx.workspaceRoot);
+		if (reason) return uncertain(`grep ${reason}`);
+		// A directory/glob target under a deliberate reach can recurse into secret files
+		// whose basenames the direct-name gate above never sees -> uncertain.
+		if (deliberateReach && (/[*?[]/.test(target) || isDirectoryTarget(target, ctx.workspaceRoot)))
+			return uncertain(`grep with gitignore disabled or hidden files enabled recursively scans a directory that may contain secrets: ${target}`);
 	}
 	return ALLOW;
 }
@@ -389,7 +459,10 @@ export function isProvablySafeHubCall(args: unknown): boolean {
  *
  * - `bash`: `proveBashSafe` (see there) — allow only a flat in-workspace command
  *   with no dangerous effect; uncertain for anything that relocates execution.
- * - `todo`: session-local task tracker with no fs/exec effect → always allow.
+ * - `todo` / `ask`: session-local tools with no fs/exec effect → always allow.
+ * - `grep`: read-tier but searchable anywhere; a search path inside the workspace
+ *   (or absent → defaults to workspace) → allow; outside it, or naming a
+ *   secret/env file → uncertain (escapes get escalated, never a blind allow).
  * - `eval`: a destructive shell pattern embedded in the code → deny; otherwise
  *   uncertain (arbitrary unsandboxed code is never provably safe).
  * - `write` / `edit` / `ast_edit` / `tts`: every caller-supplied path proved
@@ -410,6 +483,9 @@ export function classifyHeuristic(toolName: string, args: unknown, ctx: Heuristi
 			// Session-local tools with no filesystem/exec/network effect (task tracker,
 			// user prompt): always safe.
 			return ALLOW;
+		case "grep":
+			// Read-tier, but searchable anywhere on disk -> prove containment.
+			return classifyGrepRead(record, ctx);
 		case "bash": {
 			const command = typeof record.command === "string" ? record.command : "";
 			const rawCwd = typeof record.cwd === "string" && record.cwd.length > 0 ? record.cwd : undefined;

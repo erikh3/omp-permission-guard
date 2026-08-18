@@ -123,6 +123,16 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		// `hub` is exec-tier, but its coordination/inspection ops carry no host risk;
 		// auto-allow them so the judge is never invoked for benign agent messaging.
 		if (tier === EXEC_TIER && toolName === "hub" && isProvablySafeHubCall(args)) return { action: "allow" };
+		// `grep` is read-tier but can search outside the workspace; prove it here and
+		// escalate only the unprovable ones to the judge (an in-workspace search never
+		// bothers the model). Every other read-tier tool is auto-allowed.
+		if (toolName === "grep") {
+			const gv = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
+			if (gv.decision === "allow") return { action: "allow" };
+			// `classifyGrepRead` is allow/uncertain-only (never a hard deny), so this is
+			// always an unprovable read escalated to the judge, not a proven-blocked one.
+			return runGuardian({ reason: gv.reason, blocked: false });
+		}
 		return tier === EXEC_TIER ? runGuardian({}) : { action: "allow" };
 	}
 
