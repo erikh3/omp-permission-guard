@@ -161,8 +161,14 @@ describe("classifyHeuristic (other tools)", () => {
 			classifyHeuristic("grep", { pattern: "x", path: "/tmp/allowed" }, { ...rctx, extraRoots: ["/tmp/allowed"] }).decision,
 		).toBe("allow");
 	});
-	test("grep internal-URL path -> uncertain", () => {
-		expect(classifyHeuristic("grep", { pattern: "x", path: "artifact://abc" }, rctx).decision).toBe("uncertain");
+	test("grep session-local artifact:// URL -> allow (session-scoped, cannot escape)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "artifact://22" }, rctx).decision).toBe("allow");
+	});
+	test("grep session-local agent:// URL -> allow", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "agent://Worker" }, rctx).decision).toBe("allow");
+	});
+	test("grep non-session internal-URL (ssh://) -> uncertain", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "ssh://host/etc" }, rctx).decision).toBe("uncertain");
 	});
 	test("edit patch-mode rename escaping the workspace -> deny", () => {
 		const args = { path: "src/a.ts", edits: [{ op: "update", rename: "../../../../../../etc/evil.ts" }] };

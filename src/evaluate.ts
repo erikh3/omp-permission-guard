@@ -15,7 +15,7 @@ export type GuardMode = "heuristic" | "guardian" | "hybrid";
 export type PermissionAction =
 	| { action: "allow" }
 	| { action: "deny"; reason: string }
-	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny"; judged?: boolean; confidence?: number };
+	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny"; judged?: boolean; confidence?: number; guardianError?: boolean };
 
 /** Minimal guardian surface the orchestrator needs. */
 export interface Guardian {
@@ -55,7 +55,10 @@ export interface EvaluatePermissionInput {
 const EXEC_TIER: ToolTier = "exec";
 
 function failSafe(hasUI: boolean, reason?: string): PermissionAction {
-	if (hasUI) return reason ? { action: "prompt", reason, recommend: "deny" } : { action: "prompt", recommend: "deny" };
+	if (hasUI)
+		return reason
+			? { action: "prompt", reason, recommend: "deny", guardianError: true }
+			: { action: "prompt", recommend: "deny", guardianError: true };
 	return {
 		action: "deny",
 		reason: reason ? `Guardian unavailable: ${reason}` : "Guardian unavailable; denying to fail safe.",
