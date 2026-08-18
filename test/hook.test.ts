@@ -17,6 +17,7 @@ type Handler = (event: { toolName: string; input: unknown }, ctx: unknown) => Pr
 
 function harness() {
 	let handler: Handler | undefined;
+	const busEmits: { channel: string; data: unknown }[] = [];
 	const commands: Record<
 		string,
 		{
@@ -41,9 +42,11 @@ function harness() {
 			{ name: "read", description: "", parameters: {} },
 			{ name: "grep", description: "", parameters: {} },
 		],
+		// Shared extension bus; the guard emits `herdr:blocked` here while a dialog is open.
+		events: { emit: (channel: string, data: unknown) => busEmits.push({ channel, data }) },
 	};
 	permissionGuard(pi as unknown as Parameters<typeof permissionGuard>[0]);
-	return { handler: handler!, commands };
+	return { handler: handler!, commands, busEmits };
 }
 
 const notes: string[] = [];
@@ -184,6 +187,23 @@ describe("tool_call hook wiring", () => {
 		const { handler } = harness();
 		const res = await handler({ toolName: "bash", input: { command: "echo $(date)" } }, ctx);
 		expect(res?.block).toBe(true);
+	});
+
+	test("a prompt emits balanced herdr:blocked toggles around the dialog", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, busEmits } = harness();
+		// A proven-deny bash call prompts; base ctx.select returns undefined -> deny.
+		const res = await handler({ toolName: "bash", input: { command: "rm -rf /" } }, ctx);
+		expect(res?.block).toBe(true);
+		const blocked = busEmits.filter(e => e.channel === "herdr:blocked");
+		expect(blocked.map(e => e.data)).toEqual([{ active: true, label: expect.any(String) }, { active: false }]);
+	});
+
+	test("an allowed call never prompts, so no herdr:blocked is emitted", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, busEmits } = harness();
+		expect(await handler({ toolName: "bash", input: { command: "ls -la" } }, ctx)).toBeUndefined();
+		expect(busEmits.filter(e => e.channel === "herdr:blocked")).toHaveLength(0);
 	});
 
 	test("/guard status shows the mode", async () => {
