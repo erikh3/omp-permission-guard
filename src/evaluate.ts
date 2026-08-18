@@ -99,6 +99,12 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 
 	const userPolicy = Object.hasOwn(userPolicies, toolName) ? normalizePolicy(userPolicies[toolName]) : undefined;
 	if (userPolicy === "deny") return { action: "deny", reason: `Blocked by user policy for ${toolName}.` };
+	// Secret reads/greps are denied unconditionally — even a user/omp `allow` or `prompt` policy
+	// cannot override the hard deny for secret-file access. Check this before honoring allow/prompt.
+	if (toolName === "read" || toolName === "grep") {
+		const rv = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
+		if (rv.secret) return { action: "deny", reason: rv.reason ?? `Refusing to read a secret file via ${toolName}.` };
+	}
 	if (userPolicy === "allow") return { action: "allow" };
 	if (userPolicy === "prompt")
 		return { action: "prompt", reason: `Confirmation required by user policy for ${toolName}.` };
@@ -126,15 +132,17 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		// `hub` is exec-tier, but its coordination/inspection ops carry no host risk;
 		// auto-allow them so the judge is never invoked for benign agent messaging.
 		if (tier === EXEC_TIER && toolName === "hub" && isProvablySafeHubCall(args)) return { action: "allow" };
-		// `grep` is read-tier but can search outside the workspace; prove it here and
-		// escalate only the unprovable ones to the judge (an in-workspace search never
+		// `grep` and `read` are read-tier but can reach anywhere on disk (secret/env
+		// files, paths outside the workspace); prove them here and escalate only the
+		// unprovable ones to the judge (an in-workspace, non-secret access never
 		// bothers the model). Every other read-tier tool is auto-allowed.
-		if (toolName === "grep") {
-			const gv = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
-			if (gv.decision === "allow") return { action: "allow" };
-			// `classifyGrepRead` is allow/uncertain-only (never a hard deny), so this is
-			// always an unprovable read escalated to the judge, not a proven-blocked one.
-			return runGuardian({ reason: gv.reason, blocked: false });
+		if (toolName === "grep" || toolName === "read") {
+			const rv = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
+			if (rv.decision === "allow") return { action: "allow" };
+			// A secret/env-file read is always a hard deny — never the guardian, never the user.
+			if (rv.secret) return { action: "deny", reason: rv.reason ?? `Refusing to read a secret file via ${toolName}.` };
+			// Otherwise an unprovable workspace escape -> escalate to the judge.
+			return runGuardian({ reason: rv.reason, blocked: false });
 		}
 		return tier === EXEC_TIER ? runGuardian({}) : { action: "allow" };
 	}
@@ -145,6 +153,9 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 
 	if (verdict.decision === "deny") {
 		const reason = verdict.reason ?? `Blocked by safety heuristic for ${toolName}.`;
+		// A secret/env-file read is always a hard, non-escalatable deny — no guardian upgrade,
+		// no confirm dialog. This is the only deny that unconditionally skips the ladder below.
+		if (verdict.secret) return { action: "deny", reason };
 		// hybrid: give the Guardian a chance to honor an explicitly user-requested dangerous
 		// action. Upgrade-only — a Guardian that denies, errors, or is unavailable leaves the
 		// block in place, so the safety net never weakens when no judge can adjudicate intent.

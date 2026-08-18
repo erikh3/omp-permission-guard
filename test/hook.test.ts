@@ -6,7 +6,10 @@
  * test). Mode is forced via `OMP_GUARD_MODE`, which takes precedence over the
  * config file.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import permissionGuard from "../src/index";
 
 type ToolCallResult = { block?: boolean; reason?: string } | undefined;
@@ -14,7 +17,13 @@ type Handler = (event: { toolName: string; input: unknown }, ctx: unknown) => Pr
 
 function harness() {
 	let handler: Handler | undefined;
-	const commands: Record<string, { handler: (a: unknown, c: unknown) => Promise<void> }> = {};
+	const commands: Record<
+		string,
+		{
+			handler: (a: unknown, c: unknown) => Promise<void>;
+			getArgumentCompletions?: (prefix: string) => { value: string; label: string; description?: string }[] | null;
+		}
+	> = {};
 	const pi = {
 		logger: { debug: (msg: string, data?: unknown) => logs.push({ msg, data }) },
 		setLabel: () => {},
@@ -68,9 +77,24 @@ function selectUi(
 	};
 }
 
+const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"] as const;
+const savedEnv: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+	for (const k of ENV_KEYS) {
+		savedEnv[k] = process.env[k];
+		delete process.env[k];
+	}
+});
+
 afterEach(() => {
 	delete process.env.OMP_GUARD_MODE;
+	notes.length = 0;
 	logs.length = 0;
+	for (const k of ENV_KEYS) {
+		if (savedEnv[k] === undefined) delete process.env[k];
+		else process.env[k] = savedEnv[k];
+	}
 });
 
 describe("tool_call hook wiring", () => {
@@ -94,10 +118,24 @@ describe("tool_call hook wiring", () => {
 		expect(await handler({ toolName: "bash", input: { command: "ls -la" } }, ctx)).toBeUndefined();
 	});
 
-	test("read-tier tool is skipped even in heuristic", async () => {
+	test("read of an ordinary in-workspace file is allowed (undefined)", async () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
 		const { handler } = harness();
-		expect(await handler({ toolName: "read", input: { path: "/etc/passwd" } }, ctx)).toBeUndefined();
+		expect(await handler({ toolName: "read", input: { path: "src/index.ts" } }, ctx)).toBeUndefined();
+	});
+
+	test("read of a secret file (.env) is gated, not skipped as read-tier", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		const res = await handler({ toolName: "read", input: { path: ".env" } }, ctx);
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("permission-guard");
+	});
+
+	test("read escaping the workspace (/etc/passwd) is gated, not skipped", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		expect((await handler({ toolName: "read", input: { path: "/etc/passwd" } }, ctx))?.block).toBe(true);
 	});
 
 	test("grep inside the workspace -> allowed (undefined), not skipped as read-tier", async () => {
@@ -220,6 +258,29 @@ describe("tool_call hook wiring", () => {
 		expect(await handler(call, sessionCtx)).toBeUndefined(); // user allows for the session
 		expect(await handler(call, sessionCtx)).toBeUndefined(); // identical call auto-allowed
 		expect(dialogCalls).toBe(1); // prompted only once
+	});
+
+	test("session allow ignores volatile fields: same command, different timeout -> still cached", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let dialogCalls = 0;
+		const sessionCtx = {
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async (_t: string, options: string[]) => {
+					dialogCalls++;
+					return options.find(o => o.includes("Allow this exact call"));
+				},
+			},
+		};
+		const { handler } = harness();
+		// The agent re-issues the SAME command (command-substitution -> uncertain -> prompts) with a
+		// different, then absent, `timeout`. Volatile `timeout` must not change the session-allow key.
+		expect(await handler({ toolName: "bash", input: { command: "echo $(date)", timeout: 60 } }, sessionCtx)).toBeUndefined();
+		expect(await handler({ toolName: "bash", input: { command: "echo $(date)", timeout: 120 } }, sessionCtx)).toBeUndefined();
+		expect(await handler({ toolName: "bash", input: { command: "echo $(date)" } }, sessionCtx)).toBeUndefined();
+		expect(dialogCalls).toBe(1); // prompted only once despite the timeout variance
 	});
 
 	test("'Deny (type your own)' forwards the user's typed message to the agent", async () => {
@@ -375,5 +436,184 @@ describe("tool_call hook wiring", () => {
 		const { handler } = harness();
 		// A call inside an /add-dir root resolves in-workspace -> allowed without prompting.
 		expect(await handler({ toolName: "bash", input: { command: "cd /private/tmp && ls" } }, mrCtx)).toBeUndefined();
+	});
+
+	test("omp config tools.approval flows through: an omp-allowed MCP tool is not gated", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-hook-"));
+		const prev = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		try {
+			fs.writeFileSync(
+				path.join(agentDir, "config.yml"),
+				'tools:\n  approval:\n    mcp__demo_lookup: allow\n    mcp__demo_mutate: deny\n',
+			);
+			const { handler } = harness();
+			// Un-vetted write-tier MCP tool would prompt/deny under heuristic; the omp `allow` clears it.
+			expect(await handler({ toolName: "mcp__demo_lookup", input: { q: "x" } }, ctx)).toBeUndefined();
+			// And an omp `deny` hard-blocks without any prompt.
+			const denied = await handler({ toolName: "mcp__demo_mutate", input: { q: "x" } }, ctx);
+			expect(denied?.block).toBe(true);
+		} finally {
+			if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = prev;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("/guard allowed + revoke commands", () => {
+	/** A ctx.ui whose select returns whatever `pick` yields; records notifications. */
+	function cmdCtx(pick?: (title: string, options: string[]) => string | undefined) {
+		const seen: string[] = [];
+		return {
+			ctx: {
+				...ctx,
+				ui: {
+					notify: (m: string) => seen.push(m),
+					input: async () => undefined,
+					select: async (title: string, options: string[]) => pick?.(title, options),
+				},
+			},
+			seen,
+		};
+	}
+
+	/** Approve "allow this exact call" for a bash command, populating the session allow-list. */
+	async function allow(handler: Handler, command: string) {
+		const sessionCtx = {
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async (_t: string, options: string[]) => options.find(o => o.includes("Allow this exact call")),
+			},
+		};
+		await handler({ toolName: "bash", input: { command } }, sessionCtx);
+	}
+
+	test("/guard allowed lists entries sorted by insertion (last added at the bottom)", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, commands } = harness();
+		await allow(handler, "cat $(first)");
+		await allow(handler, "cat $(second)");
+		let shown: string[] = [];
+		const { ctx: c } = cmdCtx((_t, options) => {
+			shown = options;
+			return undefined; // cancel: just capture the list
+		});
+		await commands.guard!.handler("allowed", c);
+		expect(shown).toEqual(["1. bash: cat $(first)", "2. bash: cat $(second)"]);
+	});
+
+	test("/guard allowed -> selecting an entry revokes it (re-prompts next time)", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, commands } = harness();
+		await allow(handler, "cat $(keep)");
+		// Must return the index-prefixed option string; the handler parses the leading "1." to get the key.
+		const { ctx: c } = cmdCtx((_t, _o) => "1. bash: cat $(keep)");
+		await commands.guard!.handler("allowed", c);
+		// After revoke, the same call is no longer cached -> the guard evaluates it again (deny via no-op UI).
+		const res = await handler({ toolName: "bash", input: { command: "cat $(keep)" } }, { ...ctx, ui: { ...ctx.ui, select: async () => "Deny" } });
+		expect(res?.block).toBe(true);
+	});
+
+	test("/guard revoke <call> removes the exact entry", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, commands } = harness();
+		await allow(handler, "cat $(target)");
+		const { ctx: c, seen } = cmdCtx();
+		await commands.guard!.handler("revoke bash: cat $(target)", c);
+		expect(seen.some(m => m.includes("revoked session allow"))).toBe(true);
+		const res = await handler({ toolName: "bash", input: { command: "cat $(target)" } }, { ...ctx, ui: { ...ctx.ui, select: async () => "Deny" } });
+		expect(res?.block).toBe(true); // no longer cached
+	});
+
+	test("/guard revoke autocomplete offers the current allow-list", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, commands } = harness();
+		await allow(handler, "cat $(alpha)");
+		await allow(handler, "cat $(beta)");
+		const items = await commands.guard!.getArgumentCompletions!("revoke ");
+		expect(items?.map((i: { value: string }) => i.value)).toEqual([
+			"revoke bash: cat $(alpha)",
+			"revoke bash: cat $(beta)",
+		]);
+	});
+	test("/guard completes subcommand words", async () => {
+		const { commands } = harness();
+		const items = await commands.guard!.getArgumentCompletions!("all");
+		expect(items?.map((i: { value: string }) => i.value)).toContain("allowed");
+	});
+
+	test("colliding labels: /guard allowed shows two rows; picking row 2 removes only that entry; /guard revoke removes all matching", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler, commands } = harness();
+
+		// Two bash calls with the same command (same label) but a differing non-preview field
+		// so stableStringify produces distinct keys. Both hit the prompt (command substitution
+		// makes heuristic uncertain).
+		const makeSessionCtx = () => ({
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async (_t: string, options: string[]) =>
+					options.find(o => o.includes("Allow this exact call")),
+			},
+		});
+		await handler({ toolName: "bash", input: { command: "cat $(collision)" } }, makeSessionCtx());
+		await handler({ toolName: "bash", input: { command: "cat $(collision)", extraField: 1 } }, makeSessionCtx());
+
+		// Both should appear as separate entries in /guard allowed.
+		let captured: string[] = [];
+		const { ctx: c1 } = cmdCtx((_t, options) => { captured = options; return undefined; });
+		await commands.guard!.handler("allowed", c1);
+		expect(captured).toHaveLength(2);
+		expect(captured[0]).toBe("1. bash: cat $(collision)");
+		expect(captured[1]).toBe("2. bash: cat $(collision)");
+
+		// Picking row 2 removes only that entry; row 1 (different key) stays cached.
+		const { ctx: c2, seen: seen2 } = cmdCtx((_t, options) => options[1]); // pick "2. bash: ..."
+		await commands.guard!.handler("allowed", c2);
+		expect(seen2.some(m => m.includes("revoked session allow"))).toBe(true);
+
+		// Row 1's call is still cached (auto-allows without prompting).
+		let dialogsAfterRevoke = 0;
+		const watchCtx = {
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async (_t: string, options: string[]) => {
+					dialogsAfterRevoke++;
+					return options.find(o => o.includes("Allow this exact call"));
+				},
+			},
+		};
+		await handler({ toolName: "bash", input: { command: "cat $(collision)" } }, watchCtx);
+		expect(dialogsAfterRevoke).toBe(0); // row 1 key still cached
+
+		// Row 2's key is gone: the call re-prompts.
+		await handler({ toolName: "bash", input: { command: "cat $(collision)", extraField: 1 } }, watchCtx);
+		expect(dialogsAfterRevoke).toBe(1); // row 2 was revoked, re-prompts now
+
+		// /guard revoke <label> removes ALL entries matching that label (here only the 1 remaining).
+		const { ctx: c3, seen: seen3 } = cmdCtx();
+		await commands.guard!.handler("revoke bash: cat $(collision)", c3);
+		expect(seen3.some(m => m.includes("revoked"))).toBe(true);
+
+		// Now both are gone: next call re-prompts.
+		let dialogsFinal = 0;
+		const finalCtx = {
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async () => { dialogsFinal++; return "Deny"; },
+			},
+		};
+		await handler({ toolName: "bash", input: { command: "cat $(collision)" } }, finalCtx);
+		expect(dialogsFinal).toBe(1); // last entry was revoked
 	});
 });

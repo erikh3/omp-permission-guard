@@ -88,26 +88,39 @@ const SECRET_FILE_PATTERNS: readonly RegExp[] = [
 	/\.(pem|key|pfx|p12|keystore|jks|token|tokens)$/i,
 ] as const;
 
-/** True when the basename or an enclosing `.ssh` segment marks the path as secret-bearing. */
+/** Directory segment names whose presence on any path marks it as secret-bearing. */
+const SECRET_DIR_SEGMENTS: Record<string, true> = { ".ssh": true, ".aws": true, ".gnupg": true };
+
+/** True when the basename or an enclosing secret-directory segment marks the path as secret-bearing. */
 function isSecretPath(resolved: string): boolean {
 	const segments = resolved.split(path.sep).filter(Boolean);
-	if (segments.some(s => s.toLowerCase() === ".ssh")) return true;
+	if (segments.some(s => Object.hasOwn(SECRET_DIR_SEGMENTS, s.toLowerCase()))) return true;
 	const base = path.basename(resolved);
 	return SECRET_FILE_PATTERNS.some(re => re.test(base));
 }
 
 /**
- * Classify a READ target (e.g. a `grep` search path). Unlike the write denylist,
- * a read is unremarkable anywhere inside the workspace — EXCEPT for secret / env
- * files, whose contents must not be exfiltrated even locally. Returns a reason
- * when the path is outside the workspace root OR names a secret/env file (so the
- * caller escalates it), and `null` for an ordinary in-workspace read.
+ * True when a READ target resolves to a secret/env file (`.env`, `id_rsa`,
+ * `*.pem`, anything under `.ssh/`, …) whose contents must never be exfiltrated —
+ * regardless of whether it sits inside the workspace or an allowlisted external
+ * root. Resolves symlinks first so a link to a secret is caught. This is the
+ * highest-priority read gate; callers deny (or escalate) on a true result before
+ * any workspace/allowlist allow.
+ */
+export function isSecretReadTarget(targetPath: string, workspaceRoot: string): boolean {
+	return isSecretPath(resolveSymlinkTarget(resolveTargetPath(targetPath, workspaceRoot)));
+}
+
+/**
+ * Classify a READ target for the WORKSPACE-CONTAINMENT check only. Returns a
+ * reason when the path escapes the workspace root, else `null`. The secret-file
+ * gate is handled separately by `isSecretReadTarget` (which callers apply first),
+ * so this deliberately does not re-check secrets.
  */
 export function classifyReadPath(targetPath: string, workspaceRoot: string): string | null {
 	const resolved = resolveSymlinkTarget(resolveTargetPath(targetPath, workspaceRoot));
 	const root = realpathOrSelf(path.resolve(workspaceRoot));
 	if (!isPathInside(resolved, root)) return `outside the workspace root: ${resolved}`;
-	if (isSecretPath(resolved)) return `reads a secret or environment file: ${resolved}`;
 	return null;
 }
 

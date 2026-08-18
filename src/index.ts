@@ -15,19 +15,19 @@
  * `~/.omp/agent/permission-guard.json` > default (`hybrid`).
  */
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import { evaluatePermission, type GuardMode } from "./evaluate";
 import { GuardianJudge } from "./guardian";
+import { loadOmpApprovalRules, resolveAgentDir } from "./omp-config";
 import { matchWorkspaceEscape } from "./risky-paths";
 import { getToolTier } from "./tier";
 
 type Mode = GuardMode | "off";
 const MODES: Record<string, true> = { off: true, heuristic: true, guardian: true, hybrid: true };
 const DEFAULT_MODE: Mode = "hybrid";
-const CONFIG_PATH = path.join(os.homedir(), ".omp", "agent", "permission-guard.json");
+const CONFIG_PATH = path.join(resolveAgentDir(), "permission-guard.json");
 
 interface GuardConfig {
 	mode?: Mode;
@@ -39,6 +39,8 @@ interface GuardConfig {
 	escalateBlocked?: boolean;
 	/** Surface a confirm dialog instead of a hard block when a UI exists (headless still hard-denies). Default true. */
 	promptOnBlock?: boolean;
+	/** Read omp's own `tools.approval` allow-list from config.yml and apply it under this file's `approval`. Default true. */
+	readOmpConfig?: boolean;
 }
 
 function isMode(value: unknown): value is Mode {
@@ -96,6 +98,52 @@ function previewArgs(toolName: string, args: unknown): string {
 		text = String(args);
 	}
 	return clip(text);
+}
+
+/**
+ * Fields that vary between otherwise-identical tool calls and are irrelevant to
+ * the safety decision, so they must not be part of the session-allow identity.
+ * `bash`'s `timeout` is the culprit behind the "allow this exact call" miss: the
+ * agent re-issues the same command with a different (or omitted) `timeout`, which
+ * changed `JSON.stringify(input)` and defeated the cache.
+ */
+const VOLATILE_INPUT_KEYS: Record<string, true> = { timeout: true };
+
+/**
+ * Deterministic stringify with sorted keys — does NOT filter volatile fields; that
+ * stripping happens at the top level only in `sessionCallKey`.
+ */
+function stableStringify(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+	if (value && typeof value === "object") {
+		const rec = value as Record<string, unknown>;
+		const keys = Object.keys(rec).sort();
+		return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(rec[k])}`).join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
+let _sessionCallKeyCounter = 0;
+/** Stable identity for a tool call used by the "allow this exact call this session" cache. */
+function sessionCallKey(toolName: string, input: unknown): string {
+	try {
+		// Strip volatile keys at the TOP LEVEL only to avoid over-broadening identity for
+		// nested fields that happen to share the same name (e.g. a nested `timeout`).
+		let sanitized: unknown = input;
+		if (input && typeof input === "object" && !Array.isArray(input)) {
+			const rec = input as Record<string, unknown>;
+			const stripped: Record<string, unknown> = {};
+			for (const k of Object.keys(rec)) {
+				if (!Object.hasOwn(VOLATILE_INPUT_KEYS, k)) stripped[k] = rec[k];
+			}
+			sanitized = stripped;
+		}
+		return `${toolName}:${stableStringify(sanitized)}`;
+	} catch {
+		// A circular or pathological input must degrade to a cache MISS (re-prompt)
+		// rather than throwing out of the hot tool_call handler.
+		return `${toolName}:__fallback_${_sessionCallKeyCounter++}__`;
+	}
 }
 
 const MAX_INTENT_TURNS = 3;
@@ -234,7 +282,12 @@ async function askApproval(
 export default function permissionGuard(pi: ExtensionAPI): void {
 	const logger = pi.logger;
 	let sessionMode: Mode | undefined;
-	const sessionAllow = new Set<string>();
+	// Session "allow this exact call" entries, keyed by `sessionCallKey`. The value carries a
+	// human-readable label (for `/guard allowed`) and a monotonic sequence so the list can be
+	// shown in insertion order (last-added at the bottom). A Map is required here: dynamic
+	// insertion/removal, `.size`, iteration, and stable insertion order.
+	const sessionAllow = new Map<string, { label: string; seq: number }>();
+	let allowSeq = 0;
 	const sessionAllowedRoots = new Set<string>();
 
 	pi.setLabel("Permission Guard");
@@ -247,20 +300,97 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		return isMode(cfgMode) ? cfgMode : DEFAULT_MODE;
 	};
 
+	/** Session-allow entries sorted by insertion order — last added at the bottom, matching the list UX. */
+	const sortedAllowed = (): { key: string; label: string }[] =>
+		[...sessionAllow.entries()]
+			.sort((a, b) => a[1].seq - b[1].seq)
+			.map(([key, v]) => ({ key, label: v.label }));
+
+	const MODE_HINT = "off | heuristic | guardian | hybrid | status | allowed | revoke <call>";
+
 	pi.registerCommand("guard", {
-		description: "View or set the permission-guard mode (off | heuristic | guardian | hybrid | status)",
+		description: `Permission guard: set mode (${MODE_HINT})`,
+		getArgumentCompletions: (prefix: string) => {
+			const p = prefix.trimStart();
+			// `revoke ` (or a partial `revoke`+space): complete the remainder against the allow-list.
+			const revokeMatch = /^revoke(\s+(.*))?$/is.exec(p);
+			if (revokeMatch && (p.length > "revoke".length || /\s$/.test(prefix))) {
+				const term = (revokeMatch[2] ?? "").toLowerCase();
+				return sortedAllowed()
+					.filter(e => e.label.toLowerCase().includes(term))
+					.map(e => ({ value: `revoke ${e.label}`, label: e.label, description: "revoke session allow" }));
+			}
+			// Otherwise complete the subcommand word itself.
+			const subs = ["status", "off", "heuristic", "guardian", "hybrid", "allowed", "revoke"];
+			const term = p.toLowerCase();
+			return subs
+				.filter(s => s.startsWith(term))
+				.map(s => ({ value: s, label: s, description: "permission-guard" }));
+		},
 		handler: async (args, ctx) => {
-			const arg = (Array.isArray(args) ? args.join(" ") : String(args ?? "")).trim().toLowerCase();
-			if (arg === "" || arg === "status") {
-				ctx.ui.notify(`Permission guard mode: ${resolveMode()} (config: ${CONFIG_PATH})`, "info");
+			const raw = (Array.isArray(args) ? args.join(" ") : String(args ?? "")).trim();
+			const sub = (raw.split(/\s+/)[0] ?? "").toLowerCase();
+			const rest = raw.slice(sub.length).trim();
+
+			if (raw === "" || sub === "status") {
+				ctx.ui.notify(
+					`Permission guard mode: ${resolveMode()} · ${sessionAllow.size} session-allowed call(s) (config: ${CONFIG_PATH})`,
+					"info",
+				);
 				return;
 			}
-			if (!isMode(arg)) {
-				ctx.ui.notify(`Unknown mode "${arg}". Use: off | heuristic | guardian | hybrid | status`, "warn");
+			if (sub === "allowed") {
+				const entries = sortedAllowed();
+				if (entries.length === 0) {
+					ctx.ui.notify("Permission guard: no calls allowed for this session.", "info");
+					return;
+				}
+				// Build index-prefixed option strings so each selection is unique even when labels collide.
+				const options = entries.map((e, i) => `${i + 1}. ${e.label}`);
+				const picked = await ctx.ui.select(
+					`Session-allowed calls (${entries.length}) — select one to revoke`,
+					options,
+					{ outline: true },
+				);
+				if (picked === undefined) return; // ESC / cancel: leave the list untouched
+				// Parse the leading "N." back to the unique key — deterministic even with colliding labels.
+				const match = /^(\d+)\./.exec(picked);
+				if (match) {
+					const idx = parseInt(match[1], 10) - 1;
+					const entry = entries[idx];
+					if (entry) {
+						sessionAllow.delete(entry.key);
+						ctx.ui.notify(`Permission guard: revoked session allow for ${entry.label}`, "info");
+					}
+				}
 				return;
 			}
-			sessionMode = arg;
-			ctx.ui.notify(`Permission guard mode set to "${arg}" for this session.`, "info");
+			if (sub === "revoke") {
+				if (!rest) {
+					ctx.ui.notify("Usage: /guard revoke <call> — see /guard allowed for the list.", "warn");
+					return;
+				}
+				// Delete ALL entries whose label matches, so colliding labels are fully cleared.
+				const matching = sortedAllowed().filter(e => e.label === rest);
+				if (matching.length === 0) {
+					ctx.ui.notify(`Permission guard: no session-allowed call matching "${rest}".`, "warn");
+					return;
+				}
+				for (const entry of matching) sessionAllow.delete(entry.key);
+				ctx.ui.notify(
+					matching.length === 1
+						? `Permission guard: revoked session allow for ${rest}`
+						: `Permission guard: revoked ${matching.length} session allows for ${rest}`,
+					"info",
+				);
+				return;
+			}
+			if (!isMode(sub)) {
+				ctx.ui.notify(`Unknown argument "${sub}". Use: ${MODE_HINT}`, "warn");
+				return;
+			}
+			sessionMode = sub;
+			ctx.ui.notify(`Permission guard mode set to "${sub}" for this session.`, "info");
 		},
 	});
 
@@ -276,10 +406,11 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		}
 
 		const tier = getToolTier(event.toolName, event.input, tools);
-		// Read-tier tools carry no write/exec risk and are skipped — EXCEPT `grep`,
-		// whose `path`/`paths` can read anywhere on disk (secrets, files outside the
-		// workspace). It stays read-tier but is proved by the classifier below.
-		if (tier === "read" && event.toolName !== "grep") return;
+		// Read-tier tools carry no write/exec risk and are skipped — EXCEPT `grep` and
+		// `read`, whose `path`/`paths` can reach anywhere on disk (secret/env files,
+		// paths outside the workspace). They stay read-tier but are proved by the
+		// classifier below.
+		if (tier === "read" && event.toolName !== "grep" && event.toolName !== "read") return;
 
 		const argsPreview = previewArgs(event.toolName, event.input);
 		const log = (verdict: string, extra?: Record<string, unknown>) =>
@@ -290,7 +421,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				mode,
 				...extra,
 			});
-		const callKey = `${event.toolName}:${JSON.stringify(event.input)}`;
+		const callKey = sessionCallKey(event.toolName, event.input);
 		if (sessionAllow.has(callKey)) {
 			log("allow", { via: "session-cache" });
 			return;
@@ -320,12 +451,18 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 					)
 				: undefined;
 
+		// omp's own `tools.approval` allow-list feeds the same authoritative policy
+		// layer; the guard's own `approval` map overrides it on conflict. Unmatched
+		// tools fall through to tier/heuristic/guardian unchanged.
+		const ompRules = cfg.readOmpConfig !== false ? loadOmpApprovalRules(ctx.cwd, logger) : {};
+		const userPolicies = { ...ompRules, ...(cfg.approval ?? {}) };
+
 		const action = await evaluatePermission({
 			toolName: event.toolName,
 			args: event.input,
 			tier,
 			mode,
-			userPolicies: cfg.approval ?? {},
+			userPolicies,
 			workspaceRoot: ctx.cwd,
 			hasUI: ctx.hasUI,
 			guardian,
@@ -382,7 +519,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			return;
 		}
 		if (outcome.decision === "allow-session") {
-			sessionAllow.add(callKey);
+			sessionAllow.set(callKey, { label: `${event.toolName}: ${argsPreview}`, seq: allowSeq++ });
 			log("allow", { via: "prompt", choice: "allow-session" });
 			ctx.ui.notify(`Permission guard: allowing this ${event.toolName} call for the rest of the session.`, "info");
 			return;
