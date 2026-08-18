@@ -192,6 +192,15 @@ describe("tool_call hook wiring", () => {
 		expect(res).toBeUndefined(); // Allow once -> tool runs
 	});
 
+	test("guardian unavailable -> dialog footer shows the guardian-error status", async () => {
+		process.env.OMP_GUARD_MODE = "guardian"; // exec bash, no model -> failSafe -> guardianError prompt
+		let seen: Record<string, unknown> | undefined;
+		const spyCtx = { ...ctx, ui: selectUi("Allow once", { capture: (_o, d) => { seen = d; } }) };
+		const { handler } = harness();
+		await handler({ toolName: "bash", input: { command: "echo $(date)" } }, spyCtx);
+		expect(String(seen?.helpText)).toContain("guardian unavailable");
+	});
+
 	test("'allow this exact call this session' short-circuits identical later calls", async () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
 		let dialogCalls = 0;

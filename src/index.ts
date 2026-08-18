@@ -183,7 +183,7 @@ async function askApproval(
 	reason: string,
 	toolName: string,
 	argsPreview: string,
-	opts: { recommendDeny: boolean; externalDir?: string; judge?: string; confidence?: number; hideCall?: boolean },
+	opts: { recommendDeny: boolean; externalDir?: string; judge?: string; confidence?: number; hideCall?: boolean; guardianError?: boolean },
 ): Promise<ApprovalOutcome> {
 	const denyLabel = opts.recommendDeny ? "Deny (recommended)" : "Deny";
 	const options: string[] = ["Allow once", "Allow this exact call this session"];
@@ -203,19 +203,22 @@ async function askApproval(
 	const title = opts.hideCall ? reason : `${reason}\n\n${toolName}: ${shownArgs}`;
 
 	const denyIndex = options.indexOf(denyLabel);
-	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends),
-	// so reconstruct the nav hints and append the judge model — the only edge slot
-	// the selector exposes. `opts.judge` is set only when the guardian model
-	// produced the ruling behind this prompt (a guardian deny), not on a heuristic
-	// block, a fail-safe, or an escalation the model declined.
+	// The selector footer is `helpText ?? <default nav>` (it replaces, not appends), so we
+	// reconstruct the nav hints and append a status note — the only edge slot the selector exposes.
+	// `opts.judge` marks a guardian ruling (a model deny); `opts.guardianError` marks the opposite —
+	// the guardian could not be reached or returned no parseable verdict, so this prompt is the
+	// fail-safe fallback and the recommendation is not a model's judgment. They are mutually exclusive.
 	const nav = "up/down navigate  enter select  esc cancel";
+	const status = opts.judge
+		? ` ↳ judged by ${opts.judge}${opts.confidence !== undefined ? ` (confidence ${opts.confidence})` : ""}`
+		: opts.guardianError
+			? " ↳ guardian unavailable (no verdict) — deciding for it"
+			: undefined;
 	const picked = await ui.select(title, options, {
 		initialIndex: opts.recommendDeny ? denyIndex : 0,
 		outline: true,
 		selectionMarker: "radio",
-		helpText: opts.judge
-			? `${nav}   ·   ↳ judged by ${opts.judge}${opts.confidence !== undefined ? ` (confidence ${opts.confidence})` : ""}`
-			: undefined,
+		helpText: status ? `${nav}   ·  ${status}` : undefined,
 	});
 	if (picked === "Allow once") return { decision: "allow" };
 	if (picked?.startsWith("Allow this exact call")) return { decision: "allow-session" };
@@ -371,6 +374,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				judge: action.judged && judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
 				confidence: action.judged ? action.confidence : undefined,
 				hideCall,
+				guardianError: action.guardianError === true,
 			}),
 		);
 		if (outcome.decision === "allow") {

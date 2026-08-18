@@ -37,3 +37,23 @@ export function isInternalUrlPath(filePath: string): boolean {
 	const expanded = normalizeLocalScheme(expandTilde(normalized));
 	return INTERNAL_URL_PREFIXES.some(prefix => normalized.startsWith(prefix) || expanded.startsWith(prefix));
 }
+
+/**
+ * Session-local internal URL schemes that resolve only within the calling session's own
+ * artifact directory and so carry no workspace-escape or arbitrary-filesystem-read risk:
+ *
+ * - `artifact://<numericId>` — this session's spilled/truncated tool output (session-local
+ *   monotonic IDs, served `text/plain`, capped at 8 MiB).
+ * - `agent://<id>` — this session's subagent output (`<id>.md` under the same artifact dir).
+ *
+ * Every OTHER internal scheme can reach outside the session (`ssh://` remote hosts, `vault://`,
+ * `local://`, `mcp://`, `skill://`, `rule://`), so those stay `isInternalUrlPath`-only and remain
+ * un-provable. Kept narrow on purpose.
+ */
+const SESSION_LOCAL_URL_PREFIXES = ["artifact://", "agent://"] as const;
+
+/** True when a path is a session-local artifact/agent URL that cannot escape the session. */
+export function isSessionLocalInternalUrl(filePath: string): boolean {
+	const normalized = filePath.trim();
+	return SESSION_LOCAL_URL_PREFIXES.some(prefix => normalized.startsWith(prefix));
+}

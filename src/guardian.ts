@@ -24,8 +24,12 @@ const MAX_ARGS_CHARS = 8000;
 // The user's recent instruction is the authorization signal for explicitly-requested dangerous
 // actions; bound it so a long turn can't dominate the judge prompt (head-truncate: the ask is usually up front).
 const MAX_INTENT_CHARS = 2000;
-const GUARDIAN_MAX_TOKENS = 200;
-const REASONING_SAFE_MAX_TOKENS = 1024;
+// A verdict tool call plus a one-sentence `reason` fits comfortably here; the old 200 starved
+// verbose judges and truncated the tool-call JSON (`finish_reason=length`) -> "no parseable verdict".
+const GUARDIAN_MAX_TOKENS = 512;
+// Reasoning-capable judges: leave headroom for a thinking pass AND the verdict tool call so neither
+// is cut off. (On Anthropic, forced tool choice strips thinking provider-side — see the call site.)
+const REASONING_SAFE_MAX_TOKENS = 2048;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_BASE_BACKOFF_MS = 500;
 
@@ -237,9 +241,10 @@ export class GuardianJudge {
 		}
 
 		const userMessage = buildUserMessage(req);
-		const maxTokens = model.reasoning
-			? Math.max(GUARDIAN_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS)
-			: GUARDIAN_MAX_TOKENS;
+		// Reasoning-capable judges get the larger budget so a thinking pass plus the verdict tool
+		// call both fit; a non-reasoning model only needs room for the verdict.
+		const reasoningJudge = model.reasoning === true;
+		const maxTokens = reasoningJudge ? Math.max(GUARDIAN_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS) : GUARDIAN_MAX_TOKENS;
 		const maxAttempts = this.#maxAttempts();
 		const baseBackoff = this.#options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
 
@@ -256,7 +261,11 @@ export class GuardianJudge {
 					{
 						apiKey,
 						maxTokens,
-						disableReasoning: true,
+						// Let a reasoning-capable judge think for a sharper verdict; only suppress reasoning on
+						// non-reasoning models. NOTE: providers that reject thinking + forced tool choice
+						// (Anthropic's `disableThinkingIfToolChoiceForced`, Bedrock, some OpenAI-compat) strip
+						// it regardless, so this is an upper bound, not a guarantee of a thinking pass.
+						disableReasoning: !reasoningJudge,
 						toolChoice: { type: "tool", name: VERDICT_TOOL_NAME },
 						signal,
 					},

@@ -2,7 +2,7 @@ import { extractAllApprovalPaths } from "./approval-path";
 import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
-import { isInternalUrlPath } from "./path-utils";
+import { isInternalUrlPath, isSessionLocalInternalUrl } from "./path-utils";
 import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
@@ -216,6 +216,11 @@ function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext
 			? uncertain("grep with gitignore disabled or hidden files enabled scans ignored/hidden files that may hold secrets")
 			: ALLOW;
 	for (const spec of specs) {
+		// `artifact://` and `agent://` resolve only inside THIS session's own artifact directory
+		// (numeric/session-local IDs, no filesystem path), so grepping them cannot escape the
+		// workspace or read arbitrary files — provably safe. Other internal schemes can reach out
+		// (`ssh://` remote, `vault://`, `local://`, `mcp://`, …) and stay un-provable.
+		if (isSessionLocalInternalUrl(spec)) continue;
 		if (isInternalUrlPath(spec))
 			return uncertain(`Cannot prove grep internal-URL path stays in workspace: ${spec}`);
 		const target = stripGrepSelector(spec);
