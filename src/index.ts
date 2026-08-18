@@ -21,6 +21,7 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import { evaluatePermission, type GuardMode } from "./evaluate";
 import { GuardianJudge } from "./guardian";
+import { matchWorkspaceEscape } from "./risky-paths";
 import { getToolTier } from "./tier";
 
 type Mode = GuardMode | "off";
@@ -57,17 +58,26 @@ function loadConfig(logger?: { debug?: (...a: unknown[]) => void }): GuardConfig
 	}
 }
 
+/** Max characters shown in a confirm-dialog args preview before truncation. */
+const MAX_PREVIEW = 300;
+/** Clip a preview string to `MAX_PREVIEW` with a trailing ellipsis. */
+function clip(s: string): string {
+	return s.length > MAX_PREVIEW ? `${s.slice(0, MAX_PREVIEW)}…` : s;
+}
+
 /** A short, single-line preview of the tool args for the confirm dialog. */
 function previewArgs(toolName: string, args: unknown): string {
 	if (args && typeof args === "object") {
 		const rec = args as Record<string, unknown>;
 		if (toolName === "bash" && typeof rec.command === "string") {
-			return rec.command.length > 300 ? `${rec.command.slice(0, 300)}…` : rec.command;
+			return clip(rec.command);
 		}
 		if (toolName === "grep") {
 			// The gate on grep is about WHERE it searches, so lead with pattern + path.
+			// An empty-string `path` is treated as absent so a populated `paths` still shows.
 			const pattern = typeof rec.pattern === "string" ? rec.pattern : "";
-			const rawWhere = rec.path ?? rec.paths;
+			const rawWhere =
+				typeof rec.path === "string" && rec.path.length > 0 ? rec.path : (rec.paths ?? rec.path);
 			const where =
 				typeof rawWhere === "string"
 					? rawWhere
@@ -75,8 +85,7 @@ function previewArgs(toolName: string, args: unknown): string {
 						? rawWhere.filter(v => typeof v === "string").join("; ")
 						: "";
 			if (pattern || where) {
-				const line = where ? `pattern "${pattern}" in ${where}` : `pattern "${pattern}"`;
-				return line.length > 300 ? `${line.slice(0, 300)}…` : line;
+				return clip(where ? `pattern "${pattern}" in ${where}` : `pattern "${pattern}"`);
 			}
 		}
 	}
@@ -86,7 +95,7 @@ function previewArgs(toolName: string, args: unknown): string {
 	} catch {
 		text = String(args);
 	}
-	return text.length > 300 ? `${text.slice(0, 300)}…` : text;
+	return clip(text);
 }
 
 const MAX_INTENT_TURNS = 3;
@@ -342,7 +351,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		}
 		// The guard only prompts when it could not prove the call safe, so it leans
 		// Deny; a workspace-escape reason yields the directory we can offer to allow.
-		const externalDir = /outside the workspace root: (.+)$/.exec(reason)?.[1];
+		const externalDir = matchWorkspaceEscape(reason);
 		// The host renders `eval` code (py or js) as a syntax-highlighted block
 		// above the prompt, so skip the redundant command line for both languages.
 		const input = event.input;

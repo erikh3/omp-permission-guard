@@ -129,7 +129,9 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		if (toolName === "grep") {
 			const gv = classifyHeuristic(toolName, args, { workspaceRoot, tier, extraRoots: allowedRoots });
 			if (gv.decision === "allow") return { action: "allow" };
-			return runGuardian({ reason: gv.reason, blocked: gv.decision === "deny" });
+			// `classifyGrepRead` is allow/uncertain-only (never a hard deny), so this is
+			// always an unprovable read escalated to the judge, not a proven-blocked one.
+			return runGuardian({ reason: gv.reason, blocked: false });
 		}
 		return tier === EXEC_TIER ? runGuardian({}) : { action: "allow" };
 	}

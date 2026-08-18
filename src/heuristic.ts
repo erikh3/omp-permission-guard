@@ -3,7 +3,7 @@ import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
 import { isInternalUrlPath } from "./path-utils";
-import { classifyReadPath, classifyRiskyPath, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
+import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, realpathOrSelf, resolveTargetPath } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
 /**
@@ -184,19 +184,37 @@ function stripGrepSelector(spec: string): string {
 /**
  * Prove-or-block verdict for a `grep` read. grep is read-tier, but its `path` /
  * `paths` can point ANYWHERE on disk, so it is exempted from the read-skip and
- * proved here: a search confined to the workspace (or a session-allowed root) is
- * allowed, while a path outside the workspace — or one naming a secret/env file
- * whose contents must not be exfiltrated — is `uncertain` (heuristic denies,
- * hybrid/guardian escalate to the judge). An ABSENT path defaults to the
- * workspace root, so it is provably safe → allow. A `;`-delimited list (grep's
- * multi-root syntax) is split and every root checked.
+ * proved here. Two independent gates apply:
+ *
+ * 1. DIRECT-NAME gate (always active): a path that names a secret/env file or
+ *    escapes the workspace → `uncertain`. This fires regardless of flags.
+ *
+ * 2. RECURSIVE-REACH gate (deliberate-reach only): when `gitignore === false` or
+ *    `hidden === true` the caller is deliberately reaching into ignored/hidden
+ *    directories where secrets like `.env`, `id_rsa`, and `*.pem` live. Under
+ *    those flags a directory or glob target can recurse into secret files whose
+ *    basenames the direct-name gate never sees → `uncertain`. Under the default
+ *    flags gitignore and hidden-file exclusion strip those files automatically,
+ *    so a plain directory target (`{path:"src"}`) is safe → `allow`.
+ *
+ * An ABSENT or empty path defaults to the workspace root. Under default flags
+ * that is provably safe → `allow`. Under deliberate-reach flags the whole tree
+ * is in scope but no single provably-secret basename is targeted, so the risk
+ * cannot be proven or disproven → `uncertain`.
+ *
+ * A `;`-delimited list (grep's multi-root syntax) is split and every spec is
+ * checked independently; the first failing spec short-circuits.
  */
 function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext): HeuristicVerdict {
+	const deliberateReach = record.gitignore === false || record.hidden === true;
 	const raw = [...stringValues(record.path), ...stringValues(record.paths)];
-	// No path -> grep defaults to the workspace root: provably in-bounds.
-	if (raw.length === 0) return ALLOW;
 	const specs = raw.flatMap(s => s.split(";")).map(s => s.trim()).filter(Boolean);
-	if (specs.length === 0) return ALLOW; // e.g. `path: ""` also defaults to the workspace
+	// Absent/empty path -> whole workspace. Safe under default gitignore; a deliberate
+	// reach into ignored/hidden files across the whole tree is not provable -> uncertain.
+	if (specs.length === 0)
+		return deliberateReach
+			? uncertain("grep with gitignore disabled or hidden files enabled scans ignored/hidden files that may hold secrets")
+			: ALLOW;
 	for (const spec of specs) {
 		if (isInternalUrlPath(spec))
 			return uncertain(`Cannot prove grep internal-URL path stays in workspace: ${spec}`);
@@ -204,6 +222,10 @@ function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext
 		if (isWithinExtraRoot(target, ctx)) continue;
 		const reason = classifyReadPath(target, ctx.workspaceRoot);
 		if (reason) return uncertain(`grep ${reason}`);
+		// A directory/glob target under a deliberate reach can recurse into secret files
+		// whose basenames the direct-name gate above never sees -> uncertain.
+		if (deliberateReach && (/[*?[]/.test(target) || isDirectoryTarget(target, ctx.workspaceRoot)))
+			return uncertain(`grep with gitignore disabled or hidden files enabled recursively scans a directory that may contain secrets: ${target}`);
 	}
 	return ALLOW;
 }

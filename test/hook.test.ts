@@ -273,6 +273,16 @@ describe("tool_call hook wiring", () => {
 		expect(entry!.data).toMatchObject({ tool: "bash", tier: "exec", mode: "heuristic", via: "classifier" });
 	});
 
+	test("in-workspace grep logs via:classifier on allow", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const { handler } = harness();
+		logs.length = 0;
+		await handler({ toolName: "grep", input: { pattern: "x", path: "src" } }, ctx);
+		const entry = logs.find(l => l.msg.toLowerCase().includes("allow"));
+		expect(entry).toBeDefined();
+		expect(entry!.data).toMatchObject({ tool: "grep", via: "classifier" });
+	});
+
 	test("logs the user's choice on an interactive prompt", async () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
 		const okCtx = { ...ctx, ui: selectUi("Allow once") };

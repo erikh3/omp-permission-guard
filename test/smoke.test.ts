@@ -10,7 +10,7 @@ import { classifyHeuristic } from "../src/heuristic";
 import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
 import { extractAllApprovalPaths } from "../src/approval-path";
-import { classifyReadPath } from "../src/risky-paths";
+import { classifyReadPath, matchWorkspaceEscape } from "../src/risky-paths";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -129,6 +129,27 @@ describe("classifyHeuristic (other tools)", () => {
 			expect(classifyHeuristic("grep", { pattern: "x", path: spec }, rctx).decision).toBe("uncertain");
 		},
 	);
+	test("grep with hidden:true -> uncertain (deliberate reach)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src", hidden: true }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with gitignore:false and path -> uncertain (deliberate reach)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: ".", gitignore: false }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with gitignore:false and absent path -> uncertain (deliberate reach)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", gitignore: false }, rctx).decision).toBe("uncertain");
+	});
+	test("grep with no flags and in-workspace path -> allow (low-noise contract)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src" }, rctx).decision).toBe("allow");
+	});
+	test("grep with no flags and absent path -> allow (low-noise contract)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x" }, rctx).decision).toBe("allow");
+	});
+	test("grep non-selector colon path inside workspace -> allow (colon not stripped)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "src/a:b" }, rctx).decision).toBe("allow");
+	});
+	test("grep non-selector colon path outside workspace -> uncertain (escape survives colon)", () => {
+		expect(classifyHeuristic("grep", { pattern: "x", path: "/etc/x:y" }, rctx).decision).toBe("uncertain");
+	});
 	test("grep semicolon list with one external root -> uncertain", () => {
 		expect(classifyHeuristic("grep", { pattern: "x", path: "src; /etc" }, rctx).decision).toBe("uncertain");
 	});
@@ -545,6 +566,9 @@ describe("classifyReadPath (secret files)", () => {
 		"aws-credentials.ini",
 		"my-credentials.yaml",
 		"a/b/.ssh/known_hosts",
+		".envrc",
+		"config/.envrc",
+		".SSH/known_hosts",
 	])("gates secret file %s", p => {
 		expect(classifyReadPath(p, WS)).not.toBeNull();
 	});
@@ -575,5 +599,110 @@ describe("classifyReadPath (secret files)", () => {
 
 	test("normalizes path traversal before the secret check", () => {
 		expect(classifyReadPath("src/../.env.production", WS)).toContain("secret or environment file");
+	});
+
+	test("in-workspace secret reason contains 'secret or environment file'", () => {
+		expect(classifyReadPath(".envrc", WS)).toContain("secret or environment file");
+		expect(classifyReadPath("config/.envrc", WS)).toContain("secret or environment file");
+		expect(classifyReadPath("src/../.env", WS)).toContain("secret or environment file");
+	});
+
+	test("matchWorkspaceEscape returns undefined for a secret-file reason", () => {
+		expect(matchWorkspaceEscape("reads a secret or environment file: /x/.env")).toBeUndefined();
+	});
+
+	test("matchWorkspaceEscape returns the escaped path from an escape reason", () => {
+		expect(matchWorkspaceEscape("grep outside the workspace root: /etc/passwd")).toBe("/etc/passwd");
+	});
+});
+
+describe("evaluatePermission (grep routing)", () => {
+	const base = { userPolicies: {}, workspaceRoot: WS, hasUI: true } as const;
+	const rTier = "read" as const;
+	const allowGuardian = { evaluate: async () => ({ decision: "allow" as const }) };
+	const denyGuardian = { evaluate: async () => ({ decision: "deny" as const, reason: "no" }) };
+
+	test("guardian mode: in-workspace grep -> allow, spy guardian NOT invoked", async () => {
+		let called = false;
+		const spyGuardian = {
+			evaluate: async () => {
+				called = true;
+				throw new Error("guardian should not be invoked for safe grep");
+			},
+		};
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: "src" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: spyGuardian,
+			...base,
+		});
+		expect(a.action).toBe("allow");
+		expect(called).toBe(false);
+	});
+
+	test("guardian mode: secret grep + allow-guardian -> allow", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: allowGuardian,
+			...base,
+		});
+		expect(a.action).toBe("allow");
+	});
+
+	test("guardian mode: secret grep + deny-guardian + promptOnBlock + UI -> prompt (judged)", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: denyGuardian,
+			promptOnBlock: true,
+			...base,
+		});
+		expect(a.action).toBe("prompt");
+		expect(a.action === "prompt" && a.judged === true).toBe(true);
+	});
+
+	test("guardian mode: secret grep + deny-guardian + hasUI:false -> deny", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "guardian",
+			guardian: denyGuardian,
+			promptOnBlock: true,
+			userPolicies: {},
+			workspaceRoot: WS,
+			hasUI: false,
+		});
+		expect(a.action).toBe("deny");
+	});
+
+	test("hybrid mode: secret grep + allow-guardian -> allow", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "hybrid",
+			guardian: allowGuardian,
+			...base,
+		});
+		expect(a.action).toBe("allow");
+	});
+
+	test("hybrid mode: secret grep + no guardian + hasUI -> prompt (fail-safe)", async () => {
+		const a = await evaluatePermission({
+			toolName: "grep",
+			args: { pattern: "x", path: ".env" },
+			tier: rTier,
+			mode: "hybrid",
+			...base,
+		});
+		expect(a.action).toBe("prompt");
 	});
 });

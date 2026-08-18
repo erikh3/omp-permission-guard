@@ -72,6 +72,7 @@ function classifyResolvedPath(resolved: string, root: string, home: string): Ris
  */
 const SECRET_FILE_PATTERNS: readonly RegExp[] = [
 	/^\.env(\..+)?$/i, // .env, .env.local, .env.production, …
+	/^\.envrc$/i, // direnv config — may contain `export AWS_SECRET=…` etc.
 	/^\.netrc$/i,
 	/^\.pgpass$/i,
 	/^\.npmrc$/i,
@@ -90,7 +91,7 @@ const SECRET_FILE_PATTERNS: readonly RegExp[] = [
 /** True when the basename or an enclosing `.ssh` segment marks the path as secret-bearing. */
 function isSecretPath(resolved: string): boolean {
 	const segments = resolved.split(path.sep).filter(Boolean);
-	if (segments.includes(".ssh")) return true;
+	if (segments.some(s => s.toLowerCase() === ".ssh")) return true;
 	const base = path.basename(resolved);
 	return SECRET_FILE_PATTERNS.some(re => re.test(base));
 }
@@ -103,7 +104,7 @@ function isSecretPath(resolved: string): boolean {
  * caller escalates it), and `null` for an ordinary in-workspace read.
  */
 export function classifyReadPath(targetPath: string, workspaceRoot: string): string | null {
-	const resolved = resolveWritePath(resolveTargetPath(targetPath, workspaceRoot));
+	const resolved = resolveSymlinkTarget(resolveTargetPath(targetPath, workspaceRoot));
 	const root = realpathOrSelf(path.resolve(workspaceRoot));
 	if (!isPathInside(resolved, root)) return `outside the workspace root: ${resolved}`;
 	if (isSecretPath(resolved)) return `reads a secret or environment file: ${resolved}`;
@@ -119,19 +120,19 @@ export function realpathOrSelf(p: string): string {
 	}
 }
 
-/** Bound on symlink hops while resolving a write target (matches the kernel's ELOOP guard intent). */
+/** Bound on symlink hops while resolving a symlink target (matches the kernel's ELOOP guard intent). */
 const MAX_SYMLINK_HOPS = 40;
 
 /**
- * Best-effort resolution of where a write to `target` would actually land,
- * following symlinks on every component — including *dangling* symlinks (writing
- * through `link -> /etc/x` creates `/etc/x` even when it doesn't exist yet). Each
+ * Best-effort resolution of the canonical symlink target for `target`, following
+ * symlinks on every component — including *dangling* symlinks (writing through
+ * `link -> /etc/x` creates `/etc/x` even when it doesn't exist yet). Each
  * iteration realpaths the longest existing ancestor; if the first non-existing
  * tail element is itself a symlink, it is expanded and resolution restarts on the
  * rewritten path, so multi-hop chains (`a -> b/x`, `b -> /etc`) collapse to their
  * real destination. Bounded by `MAX_SYMLINK_HOPS`. Returns the best path reached.
  */
-function resolveWritePath(target: string): string {
+function resolveSymlinkTarget(target: string): string {
 	let current = target;
 	for (let hop = 0; hop < MAX_SYMLINK_HOPS; hop++) {
 		const tail: string[] = [];
@@ -170,6 +171,30 @@ function resolveWritePath(target: string): string {
 	return current; // hop budget exhausted (symlink loop); caller still classifies it
 }
 
+/** The marker every workspace-escape reason embeds, followed by the resolved path. */
+export const WORKSPACE_ESCAPE_MARKER = "outside the workspace root: ";
+
+/** Extract the escaped path from a reason string produced by the containment checks, or undefined. */
+export function matchWorkspaceEscape(reason: string): string | undefined {
+	const i = reason.lastIndexOf(WORKSPACE_ESCAPE_MARKER);
+	return i === -1 ? undefined : reason.slice(i + WORKSPACE_ESCAPE_MARKER.length);
+}
+
+/**
+ * Returns `true` when the resolved target is an existing directory.
+ * Used to detect when a grep spec points at a directory and could therefore
+ * recurse into secret files that the basename gate never sees.
+ * Returns `false` on any filesystem error (e.g. path does not exist).
+ */
+export function isDirectoryTarget(targetPath: string, workspaceRoot: string): boolean {
+	try {
+		const resolved = resolveTargetPath(targetPath, workspaceRoot);
+		return fs.statSync(resolved).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Classify a write/edit target path as risky.
  *
@@ -194,6 +219,6 @@ export function classifyRiskyPath(targetPath: string, workspaceRoot: string): Ri
 	// canonical root. This collapses the former lexical-then-realpath two-phase
 	// dance: a symlink escaping the workspace still resolves outside and blocks,
 	// while a real-path target under a symlinked root resolves inside and passes.
-	const real = resolveWritePath(resolved);
+	const real = resolveSymlinkTarget(resolved);
 	return classifyResolvedPath(real, root, home);
 }
