@@ -46,6 +46,8 @@ An **explicit user request wins**, without opening a prompt-injection hole:
   "escalateBlocked": true,
   "promptOnBlock": true,
   "readOmpConfig": true,
+  "skill": { "work-obsidian": "allow", "obsidian-*": "allow" },
+  "paths": { "~/.omp/agent/git.md": "allow", "/tmp/*": "allow" },
   "approval": { "bash": "prompt" }
 }
 ```
@@ -55,8 +57,10 @@ An **explicit user request wins**, without opening a prompt-injection hole:
 - `maxAttempts` — guardian retry budget (default 3).
 - `escalateBlocked` — hybrid only: escalate a heuristic-blocked exec call to the guardian so it can allow an explicitly user-requested action (upgrade-only). Default `true`; set `false` for strict prove-or-block.
 - `promptOnBlock` — when a UI exists, surface a confirm dialog instead of a hard block so you can override; headless runs still hard-deny. Default `true`; set `false` for a hard wall even interactively.
-- `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks.
+- `approval` — per-tool overrides, authoritative in **every** mode: `allow` bypasses the classifier, `deny` always blocks, `prompt` always asks. **Exception:** `skill://` / `rule://` reads are governed by `skill` (not `approval`) — a `read: deny` approval entry still blocks skill loads, but `read: allow` / `read: prompt` are overridden by the `skill` policy map.
 - `readOmpConfig` — also read omp's own `tools.approval` allow-list from `config.yml` and apply it under this file's `approval` (which wins on conflict). Default `true`; set `false` to ignore omp's list. See [Reading omp's approval list](#reading-omps-approval-list).
+- `skill` — a **map of glob patterns to policies** (same shape and `allow`/`deny`/`prompt` values as `approval`) governing `skill://` / `rule://` auto-loads (the agent pulling one of omp's installed, read-only instruction docs into context). Keys match against the doc **name** and support `*`/`?` wildcards, e.g. `{ "work-obsidian": "allow", "obsidian-*": "allow", "*": "prompt" }`. A matched `allow` loads silently, a matched `deny` blocks; a matched `prompt` — or **no match** — escalates to a dedicated skill-load dialog (headless runs, having no one to ask, fail-safe **deny**). A `deny` match wins over an overlapping `allow`. Absent/empty → every load is confirmed interactively. It is a **separate key from `approval`** because `approval` is keyed by tool name (a skill load's tool is always `read`), whereas this matches skill/rule names. See [Skill and rule loads](#skill-and-rule-loads).
+- `paths` — a **map of glob patterns to `allow` or `deny` policies** for exact target-path matching, same shape as `skill` and `approval`. Matched against the EXACT `read` / `grep` / `bash` / write target path (after `~` expansion and resolution). Only `*` / `?` wildcards; `*` spans `/`. **Granular and non-recursive:** `"/tmp/*": "allow"` covers scratch/temp dirs; `"~/.omp/agent/git.md": "allow"` a single file; a bare directory matches only that path (contents need `/*`). A `deny` match hard-blocks even inside a broader `allow` glob. Secret/env files are **still denied** regardless. Targets matching no pattern still escalate. Distinct from omp's `/add-dir` recursive roots; also distinct from `approval` (keyed by tool name) and `skill` (matched against skill/rule doc names).
 
 Runtime: `/guard status` shows the mode plus how many calls are allowed this session; `/guard hybrid` (or `off`/`heuristic`/`guardian`) switches the mode for the current session; `/guard allowed` and `/guard revoke <call>` manage the session allow-list (see below). When a call needs confirmation, the guard pauses the agent (the streaming spinner switches to "waiting for you to approve …") and shows a selector:
 
@@ -87,6 +91,22 @@ Which files are read: the active agent directory's `config.yml` (profile-aware �
 - **Config overlays are not reflected.** `--config` and `PI_CONFIG_FILES` overlays are ignored; only the global and project `config.yml` files are read.
 - **XDG path relocation is not handled** (`$XDG_*_HOME/omp`).
 
+### Skill and rule loads
+
+`skill://<name>` and `rule://<name>` reads are the agent loading one of omp's own installed, read-only instruction docs into context — a benign, expected step. They resolve only to omp-managed docs (never arbitrary filesystem paths), so they carry no workspace-escape or exfiltration risk and are **not** routed through the generic "cannot be verified as staying within the workspace" prompt every other un-provable internal URL gets.
+
+Instead, the glob-keyed `skill` policy map decides which docs auto-load (matched against the doc **name**, `*`/`?` wildcards supported):
+
+- **A matching `allow` rule** (e.g. `"work-obsidian": "allow"` or `"obsidian-*": "allow"`) → the doc loads silently, no prompt. Put the skills you routinely use here.
+- **A matching `deny` rule** → the load is blocked outright, no prompt. A `deny` match wins over an overlapping `allow`.
+- **A matching `prompt` rule, or no matching rule at all** → escalates to the user through a dedicated, **name-forward** dialog that leads with the skill/rule name (the salient fact — *which* doc the agent wants) and **recommends Allow** (pre-selected), unlike the deny-leaning generic gate. It offers:
+  - **Allow** — load this doc now (a skill loads at most once per session).
+  - **Deny** / **Deny (type your own)** — block, optionally with a message forwarded to the agent.
+
+  There is no session-wide "always load" toggle: to stop prompting for a skill, add an `allow` rule for its name (or a matching glob) to `skill`.
+
+**Headless sessions (print mode, subagents) cannot show the dialog**, so a load with no matching `allow` rule fails safe to a **deny** — exactly like every other unprovable call with no UI. To let a subagent auto-load a skill unattended, add an `allow` rule that matches its name (e.g. `"*": "allow"`) to `skill`.
+
 ## Debugging
 
 The guard emits a `[permission-guard]` debug log for every decision it makes, so you can trace exactly what was gated and why. Each line carries the tool name and an argument preview in the message, plus a structured payload:
@@ -94,7 +114,7 @@ The guard emits a `[permission-guard]` debug log for every decision it makes, so
 - **verdict** — `allow` or `deny` (the message begins with this).
 - **`tool`, `args`, `tier`, `mode`** — the call and how it was classified.
 - **`via`** — where the decision came from: `session-cache` (a prior "allow this call"), `classifier` (heuristic/guardian auto allow/deny), `headless` (no UI, hard deny), or `prompt` (you were asked).
-- **`choice`** — for a prompt, what you picked: `allow-once`, `allow-session`, `allow-dir` (with `dir`), `deny`, or `deny-custom` (with your `reason`).
+- **`choice`** — for a prompt, what you picked: `allow-once`, `allow-session`, `allow-dir` (with `dir`), `deny`, or `deny-custom` (with your `reason`). Skill/rule loads log their own choices (with the `skill` name): `skill-load-once`, `skill-load-deny`, or `skill-load-deny-custom`.
 - **`reason`** — the classifier/guardian explanation or your typed message.
 
 Escalations to the Guardian judge log separately: `[permission-guard] escalate <tool>: <args>` (with `trigger: blocked | uncertain`) when the judge is invoked, and `[permission-guard] guardian verdict <decision> for <tool>` with its ruling. Grep your omp debug log for `[permission-guard]` to see the full decision trail.

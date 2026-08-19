@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import permissionGuard from "../src/index";
+import { resolvePathPolicy } from "../src/path-utils";
 
 type ToolCallResult = { block?: boolean; reason?: string } | undefined;
 type Handler = (event: { toolName: string; input: unknown }, ctx: unknown) => Promise<ToolCallResult>;
@@ -440,6 +441,23 @@ describe("tool_call hook wiring", () => {
 		expect(title).not.toContain('"language"');
 	});
 
+	test("edit prompt shows tool name + target file only, not the patch body", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let title = "";
+		const capCtx = {
+			...ctx,
+			ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async (t: string) => { title = t; return "Deny"; } },
+		};
+		const { handler } = harness();
+		// An out-of-workspace edit escapes -> prompts. The patch body must NOT appear; only the file path.
+		const input = "[/etc/hosts#A1B2]\nPUT 1.=1:\n+127.0.0.1 evil.example.com secret-token-abc123";
+		await handler({ toolName: "edit", input: { input } }, capCtx);
+		expect(title).toContain("edit: /etc/hosts"); // tool name + target file
+		expect(title).not.toContain("PUT 1"); // no patch ops
+		expect(title).not.toContain("secret-token-abc123"); // no patch body / content
+		expect(title).not.toContain('"input"'); // not the raw JSON args
+	});
+
 	test("ask tool is allowed end-to-end (read-tier, never gated)", async () => {
 		process.env.OMP_GUARD_MODE = "guardian"; // even in guardian mode
 		const { handler } = harness();
@@ -478,6 +496,68 @@ describe("tool_call hook wiring", () => {
 			if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = prev;
 			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("skill:// load prompts with a name-forward, allow-first dialog; Allow -> allowed", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		let title = "";
+		let options: string[] = [];
+		const capCtx = {
+			...ctx,
+			ui: {
+				notify: (m: string) => notes.push(m),
+				input: async () => undefined,
+				select: async (t: string, o: string[]) => {
+					title = t;
+					options = o;
+					return o.find(x => x === "Allow");
+				},
+			},
+		};
+		const { handler } = harness();
+		const res = await handler({ toolName: "read", input: { path: "skill://obsidian-markdown" } }, capCtx);
+		expect(res).toBeUndefined();
+		expect(title).toContain("obsidian-markdown");
+		expect(title).toContain("skill");
+		// Allow leads; no scary "outside the workspace" escape framing, no dir-allow option, and no
+		// session-wide "always load" toggle (auto-load is configured via the skillLoad policy map).
+		expect(options[0]).toBe("Allow");
+		expect(options.some(o => o.startsWith("Allow the directory"))).toBe(false);
+		expect(options.some(o => o.startsWith("Always load"))).toBe(false);
+	});
+
+	test("skill:// load headless (no UI) + not allow-listed -> fail-safe block (no one to ask)", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const headless = { ...ctx, hasUI: false };
+		const { handler } = harness();
+		const res = await handler({ toolName: "read", input: { path: "skill://graphify" } }, headless);
+		expect(res?.block).toBe(true);
+	});
+
+	test("skill:// load: Deny blocks and tells the agent", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const denyCtx = { ...ctx, ui: selectUi("Deny") };
+		const { handler } = harness();
+		const res = await handler({ toolName: "read", input: { path: "skill://obsidian-markdown" } }, denyCtx);
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("obsidian-markdown");
+	});
+
+	test("a read of an out-of-workspace dir allowed via omp /add-dir is not gated", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-roots-"));
+		try {
+			fs.writeFileSync(path.join(tmp, "notes.txt"), "hi");
+			const rootCtx = {
+				...ctx,
+				sessionManager: { getEntries: () => [], getAdditionalDirectories: () => [tmp] },
+				ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async () => "Deny" },
+			};
+			const { handler } = harness();
+			expect(await handler({ toolName: "read", input: { path: path.join(tmp, "notes.txt") } }, rootCtx)).toBeUndefined();
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
 		}
 	});
 });
@@ -635,5 +715,52 @@ describe("/guard allowed + revoke commands", () => {
 		};
 		await handler({ toolName: "bash", input: { command: "cat $(collision)" } }, finalCtx);
 		expect(dialogsFinal).toBe(1); // last entry was revoked
+	});
+});
+
+describe("resolvePathPolicy (config paths glob matching)", () => {
+	const home = os.homedir();
+	const allow = (pat: string) => ({ [pat]: "allow" });
+	const deny = (pat: string) => ({ [pat]: "deny" });
+	test("exact single-file allow matches only that file", () => {
+		expect(resolvePathPolicy(path.join(home, ".omp/agent/git.md"), allow("~/.omp/agent/git.md"))).toBe("allow");
+		expect(resolvePathPolicy(path.join(home, ".omp/agent/other.md"), allow("~/.omp/agent/git.md"))).toBeUndefined();
+	});
+	test("bare directory is NON-recursive: matches the dir itself, not its contents", () => {
+		expect(resolvePathPolicy(path.join(home, ".omp/agent"), allow("~/.omp/agent"))).toBe("allow");
+		expect(resolvePathPolicy(path.join(home, ".omp/agent/git.md"), allow("~/.omp/agent"))).toBeUndefined();
+	});
+	test("trailing /* matches contents (including nested, since * spans /)", () => {
+		expect(resolvePathPolicy(path.join(home, ".omp/agent/git.md"), allow("~/.omp/agent/*"))).toBe("allow");
+		expect(resolvePathPolicy(path.join(home, ".omp/agent/sub/deep.md"), allow("~/.omp/agent/*"))).toBe("allow");
+	});
+	test("? matches a single character", () => {
+		expect(resolvePathPolicy("/var/log/a.txt", allow("/var/log/?.txt"))).toBe("allow");
+		expect(resolvePathPolicy("/var/log/ab.txt", allow("/var/log/?.txt"))).toBeUndefined();
+	});
+	test("deny entry returns deny", () => {
+		expect(resolvePathPolicy("/etc/hosts", deny("/etc/hosts"))).toBe("deny");
+	});
+	test("deny short-circuits a broader allow glob", () => {
+		expect(resolvePathPolicy("/etc/hosts", { "/etc/*": "allow", "/etc/hosts": "deny" })).toBe("deny");
+	});
+	test("no match -> undefined; empty/undefined rules -> undefined", () => {
+		expect(resolvePathPolicy("/etc/passwd", allow("~/.omp/*"))).toBeUndefined();
+		expect(resolvePathPolicy("/etc/passwd", {})).toBeUndefined();
+		expect(resolvePathPolicy("/etc/passwd", undefined)).toBeUndefined();
+	});
+	test("blank/invalid pattern keys are skipped", () => {
+		expect(resolvePathPolicy("/ok/x", { "": "allow", "   ": "allow", "/ok/*": "allow" })).toBe("allow");
+	});
+	test("/tmp/* matches a real temp dir despite the macOS /private/tmp symlink", () => {
+		const dir = fs.mkdtempSync("/tmp/omp-guard-glob-");
+		try {
+			// The heuristic realpaths bash targets, so the target arrives as /private/tmp/... on macOS.
+			// resolvePathPolicy canonicalizes the pattern prefix so /tmp/* still matches.
+			expect(resolvePathPolicy(fs.realpathSync(dir), allow("/tmp/*"))).toBe("allow");
+			expect(resolvePathPolicy(dir, allow("/tmp/*"))).toBe("allow");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

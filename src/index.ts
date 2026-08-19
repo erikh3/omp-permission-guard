@@ -18,12 +18,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
+import { extractAllApprovalPaths } from "./approval-path";
 import { evaluatePermission, type GuardMode } from "./evaluate";
 import { GuardianJudge } from "./guardian";
 import { clearBlockedMetadata, emitBlocked, type HerdrEventBus, reportBlockedMetadata } from "./herdr";
 import { loadOmpApprovalRules, resolveAgentDir } from "./omp-config";
 import { matchWorkspaceEscape } from "./risky-paths";
-import { getToolTier } from "./tier";
+import { type ApprovalPolicy, getToolTier, normalizePolicy } from "./tier";
 
 type Mode = GuardMode | "off";
 const MODES: Record<string, true> = { off: true, heuristic: true, guardian: true, hybrid: true };
@@ -42,6 +43,23 @@ interface GuardConfig {
 	promptOnBlock?: boolean;
 	/** Read omp's own `tools.approval` allow-list from config.yml and apply it under this file's `approval`. Default true. */
 	readOmpConfig?: boolean;
+	/**
+	 * Per-skill/rule auto-load policy, same shape as `approval`: a map of glob patterns (matched
+	 * against the `skill://` / `rule://` doc name) to `allow` | `deny` | `prompt`. `*`/`?` wildcards
+	 * are supported (`"work-obsidian-*": "allow"`). A matched `allow` loads silently, `deny` blocks;
+	 * a matched `prompt` or no match escalates to the name-forward dialog (headless: fail-safe deny).
+	 * Absent/empty -> every load is confirmed interactively.
+	 */
+	skill?: Record<string, string>;
+	/**
+	 * Glob → policy map (`allow` | `deny`) for exact target-path matching, same shape as `skill` and
+	 * `approval`. Matched against the EXACT `read` / `grep` / `bash` / write target path (after `~`
+	 * expansion and resolution). Only `*` / `?` wildcards; `*` spans `/`. NON-recursive by design:
+	 * `"/tmp/*": "allow"` allows temp dirs; `"~/.omp/agent/git.md": "allow"` a single file.
+	 * A `deny` match hard-blocks even inside an otherwise-allowed glob. Secret/env files still denied
+	 * regardless. Targets matching no pattern still escalate.
+	 */
+	paths?: Record<string, string>;
 }
 
 function isMode(value: unknown): value is Mode {
@@ -59,6 +77,24 @@ function loadConfig(logger?: { debug?: (...a: unknown[]) => void }): GuardConfig
 		}
 		return {};
 	}
+}
+
+/**
+ * Normalize the raw `skill` config map into a glob-pattern → `allow`|`deny` policy map.
+ * `prompt` is intentionally excluded: `resolveSkillPolicy` only acts on `allow`/`deny`; a
+ * matched `prompt` (like no match) escalates to the name-forward dialog. Keeping `prompt` in
+ * the map would be dead config surface that creates confusing entries. Returns `undefined`
+ * when there are no usable entries.
+ */
+function normalizeSkillLoadRules(raw: unknown): Record<string, "allow" | "deny"> | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const rules: Record<string, "allow" | "deny"> = {};
+	for (const [pattern, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (typeof value !== "string") continue;
+		const v = value.trim().toLowerCase();
+		if (v === "allow" || v === "deny") rules[pattern] = v;
+	}
+	return Object.keys(rules).length > 0 ? rules : undefined;
 }
 
 /** Max characters shown in a confirm-dialog args preview before truncation. */
@@ -90,6 +126,19 @@ function previewArgs(toolName: string, args: unknown): string {
 			if (pattern || where) {
 				return clip(where ? `pattern "${pattern}" in ${where}` : `pattern "${pattern}"`);
 			}
+		}
+		// Path-based write tools: the host already renders the full patch/diff above the prompt,
+		// so the args preview is redundant (and huge). Show only the target file path(s).
+		if (toolName === "edit" || toolName === "write") {
+			const paths = extractAllApprovalPaths(args);
+			if (paths.length > 0) return clip(paths.join(", "));
+		}
+		if (toolName === "ast_edit") {
+			const paths = Array.isArray(rec.paths) ? rec.paths.filter((v): v is string => typeof v === "string") : [];
+			if (paths.length > 0) return clip(paths.join(", "));
+		}
+		if (toolName === "tts" && typeof rec.output_path === "string" && rec.output_path.length > 0) {
+			return clip(rec.output_path);
 		}
 	}
 	let text: string;
@@ -296,6 +345,35 @@ async function askApproval(
 	return { decision: "deny" };
 }
 
+/**
+ * Dedicated approval dialog for a `skill://` / `rule://` load. Unlike the generic gate this one
+ * LEADS with the skill name (the salient fact: the agent wants to pull a specific instruction doc
+ * into context) and leans Allow, since loading an installed read-only doc carries no
+ * filesystem-escape or exfiltration risk. To auto-load a skill without prompting, add an `allow`
+ * rule for its name to the `skill` policy map in `permission-guard.json`.
+ */
+async function askSkillLoad(
+	ui: ExtensionUIContext,
+	skill: { kind: "skill" | "rule"; name: string },
+): Promise<ApprovalOutcome> {
+	const noun = skill.kind === "skill" ? "skill" : "rule";
+	const title = `The agent wants to load the ${noun} "${skill.name}" into context.`;
+	const options = ["Allow", "Deny", "Deny (type your own)"];
+	const picked = await ui.select(title, options, {
+		initialIndex: 0,
+		outline: true,
+		selectionMarker: "radio",
+		helpText: `up/down navigate  enter select  esc cancel   ·  ↳ loading a ${noun} is read-only, no host risk`,
+	});
+	if (picked === "Allow") return { decision: "allow" };
+	if (picked === "Deny (type your own)") {
+		const message = (await ui.input("Message to the agent", `Why are you denying the ${noun} load?`))?.trim();
+		return { decision: "deny", message: message || undefined };
+	}
+	// "Deny" or cancel (undefined) -> block.
+	return { decision: "deny" };
+}
+
 export default function permissionGuard(pi: ExtensionAPI): void {
 	const logger = pi.logger;
 	let sessionMode: Mode | undefined;
@@ -486,9 +564,13 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			intent: recentUserIntent(ctx),
 			escalateBlocked: cfg.escalateBlocked !== false,
 			promptOnBlock: cfg.promptOnBlock !== false,
-			// Session dir-allow choices + omp's multi-root workspace dirs (`/add-dir`),
-			// both treated as in-workspace by the containment heuristic.
-			allowedRoots: [...sessionAllowedRoots, ...(ctx.sessionManager?.getAdditionalDirectories?.() ?? [])],
+			// Session dir-allow choices + omp's multi-root workspace dirs (`/add-dir`) — recursive
+			// containment, treated as in-workspace by the heuristic.
+			sessionRoots: [...sessionAllowedRoots, ...(ctx.sessionManager?.getAdditionalDirectories?.() ?? [])],
+			// Config glob→policy map for exact target-path matching (`~` handled by the matcher).
+			allowedPaths: cfg.paths,
+			// Glob-keyed skill/rule auto-load policy (same shape as `approval`); invalid values dropped.
+			skillLoadRules: normalizeSkillLoadRules(cfg.skill),
 		});
 
 		if (action.action === "allow") {
@@ -505,6 +587,21 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) {
 			log("deny", { via: "headless", reason });
 			return { block: true, reason: `[permission-guard] ${reason} (no UI to confirm)` };
+		}
+		// Skill/rule loads get their own name-forward, allow-leaning dialog (auto-load is configured
+		// via the `skill` policy map, not chosen here).
+		if (action.skillLoad) {
+			const skill = action.skillLoad;
+			const outcome = await withBlockedIndicator(ctx.ui, event.toolName, pi.events, reason, () =>
+				askSkillLoad(ctx.ui, skill),
+			);
+			if (outcome.decision === "allow") {
+				log("allow", { via: "prompt", choice: "skill-load-once", skill: skill.name });
+				return;
+			}
+			const denyReason = outcome.message ?? `Denied ${skill.kind} load "${skill.name}".`;
+			log("deny", { via: "prompt", choice: outcome.message ? "skill-load-deny-custom" : "skill-load-deny", skill: skill.name });
+			return { block: true, reason: `[permission-guard] ${denyReason}` };
 		}
 		// The guard only prompts when it could not prove the call safe, so it leans
 		// Deny; a workspace-escape reason yields the directory we can offer to allow.

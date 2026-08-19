@@ -2,8 +2,8 @@ import { extractAllApprovalPaths } from "./approval-path";
 import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
-import { isInternalUrlPath, isSessionLocalInternalUrl } from "./path-utils";
-import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, isSecretReadTarget, realpathOrSelf, resolveTargetPath } from "./risky-paths";
+import { isInternalUrlPath, isSessionLocalInternalUrl, parseSkillLoad, resolvePathPolicy } from "./path-utils";
+import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, isSecretReadTarget, realpathOrSelf, resolveTargetPath, WORKSPACE_ESCAPE_MARKER } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
 /**
@@ -30,12 +30,25 @@ export interface HeuristicVerdict {
 	 * user prompt — since a secret file must never be exfiltrated.
 	 */
 	secret?: boolean;
+	/**
+	 * Set on an `uncertain` produced by a `skill://` / `rule://` read. The orchestrator
+	 * routes these through the dedicated skill-load rail (name-forward, allow-leaning
+	 * dialog) instead of the generic workspace-escape prompt, since loading an installed
+	 * read-only instruction doc carries no escape/exfiltration risk. Carries the parsed
+	 * `kind` + `name` so the dialog can name the skill.
+	 */
+	skillLoad?: { kind: "skill" | "rule"; name: string };
 }
 
 const ALLOW: HeuristicVerdict = { decision: "allow" };
 const deny = (reason: string): HeuristicVerdict => ({ decision: "deny", reason });
 const denySecret = (reason: string): HeuristicVerdict => ({ decision: "deny", reason, secret: true });
 const uncertain = (reason: string): HeuristicVerdict => ({ decision: "uncertain", reason });
+const skillLoadVerdict = (reason: string, skillLoad: { kind: "skill" | "rule"; name: string }): HeuristicVerdict => ({
+	decision: "uncertain",
+	reason,
+	skillLoad,
+});
 
 /** Context required to evaluate path-based heuristics. */
 export interface HeuristicContext {
@@ -47,6 +60,12 @@ export interface HeuristicContext {
 	 * any of these is treated as in-bounds, exactly like the workspace root.
 	 */
 	extraRoots?: readonly string[];
+	/**
+	 * Glob → policy map (`allow`|`deny`) matched against the EXACT resolved target path, from config
+	 * `paths`. Non-recursive: a bare dir matches only that path, contents need a trailing `/*`.
+	 * `deny` short-circuits over `allow`. A matched `allow` is in-bounds; `deny` is hard-blocked.
+	 */
+	allowedPaths?: Record<string, string>;
 }
 
 /**
@@ -134,12 +153,20 @@ function stringValues(value: unknown): string[] {
 	return [];
 }
 
-/** True when `p` sits inside any session-allowed extra root. */
-function isWithinExtraRoot(p: string, ctx: HeuristicContext): boolean {
+/**
+ * Returns the path policy for `p`:
+ * - `"allow"` — inside a recursive `extraRoots` dir, or `allowedPaths` matched `allow`.
+ * - `"deny"`  — `allowedPaths` matched `deny` (hard-block, beats extraRoots).
+ * - `false`   — no match; caller decides.
+ */
+function isAllowedTarget(p: string, ctx: HeuristicContext): "allow" | "deny" | false {
+	const policy = resolvePathPolicy(p, ctx.allowedPaths);
+	if (policy === "deny") return "deny";
+	if (policy === "allow") return "allow";
 	const roots = ctx.extraRoots;
 	if (!roots || roots.length === 0) return false;
 	const real = realpathOrSelf(p);
-	return roots.some(root => isPathInside(real, realpathOrSelf(root)));
+	return roots.some(root => isPathInside(real, realpathOrSelf(root))) ? "allow" : false;
 }
 
 /**
@@ -149,7 +176,33 @@ function isWithinExtraRoot(p: string, ctx: HeuristicContext): boolean {
  */
 function riskyPathReason(targetPath: string, ctx: HeuristicContext): string | null {
 	if (!targetPath || targetPath === "(unknown)" || isInternalUrlPath(targetPath)) return null;
-	if (isWithinExtraRoot(targetPath, ctx)) return null;
+	// Check config paths policy first (deny short-circuits; allow still runs classifyRiskyPath).
+	const configPolicy = resolvePathPolicy(targetPath, ctx.allowedPaths);
+	if (configPolicy === "deny") return `denied by paths policy: ${targetPath}`;
+	if (configPolicy === "allow") {
+		// Config `paths` allow grants in-bounds treatment for extra-workspace files. classifyRiskyPath
+		// follows symlinks (resolveSymlinkTarget), so we run it to catch symlink-to-denylist paths.
+		// We suppress a PURE workspace-containment block (expected for deliberately-allowed
+		// extra-workspace files), but we also check the raw realpath: if even the realpath hits the
+		// denylist (system root, .ssh, .env, .git, home dotfile) then it's a symlink escape and must
+		// be blocked.
+		const block = classifyRiskyPath(targetPath, ctx.workspaceRoot);
+		if (!block) return null;
+		const reason = block.reason ?? "";
+		if (!reason.includes(WORKSPACE_ESCAPE_MARKER)) return reason; // non-escape denylist hit → block
+		// Workspace-escape reason: check if the raw realpath independently hits the denylist.
+		// If so, this is a symlink escape (the realpath lands on a system/sensitive path).
+		const realBlock = classifyRiskyPath(realpathOrSelf(targetPath), ctx.workspaceRoot);
+		if (realBlock && !realBlock.reason?.includes(WORKSPACE_ESCAPE_MARKER)) return realBlock.reason ?? reason;
+		// Pure workspace escape with no denylist hit on the realpath → suppressed (intended extra-workspace write).
+		return null;
+	}
+	// Session extra-root containment check (from /add-dir + session dir-allow dialog).
+	const roots = ctx.extraRoots;
+	if (roots && roots.length > 0) {
+		const real = realpathOrSelf(targetPath);
+		if (roots.some(root => isPathInside(real, realpathOrSelf(root)))) return null;
+	}
 	return classifyRiskyPath(targetPath, ctx.workspaceRoot)?.reason ?? null;
 }
 
@@ -235,7 +288,9 @@ function classifyGrepRead(record: Record<string, unknown>, ctx: HeuristicContext
 		// so a secret inside an allowed dir is still refused (marked for the deny-secret policy).
 		if (isSecretReadTarget(target, ctx.workspaceRoot))
 			return denySecret(`grep targets a secret or environment file: ${target}`);
-		if (isWithinExtraRoot(target, ctx)) continue;
+		const pathPolicy = isAllowedTarget(target, ctx);
+		if (pathPolicy === "deny") return deny(`grep target denied by paths policy: ${target}`);
+		if (pathPolicy === "allow") continue;
 		const reason = classifyReadPath(target, ctx.workspaceRoot);
 		if (reason) return uncertain(`grep ${reason}`);
 		// A directory/glob target under a deliberate reach can recurse into secret files
@@ -273,13 +328,20 @@ function classifyFileRead(record: Record<string, unknown>, ctx: HeuristicContext
 	// Absent/empty path -> the read tool defaults to the workspace root listing; safe.
 	if (!raw) return ALLOW;
 	if (isSessionLocalInternalUrl(raw)) return ALLOW;
+	// `skill://` / `rule://` reads load an installed, read-only instruction doc — no fs
+	// escape or exfiltration risk. Tag them for the dedicated skill-load rail instead of
+	// the generic (deny-leaning) internal-URL escape prompt.
+	const skill = parseSkillLoad(raw);
+	if (skill) return skillLoadVerdict(`Load ${skill.kind} "${skill.name}" into context`, skill);
 	if (isInternalUrlPath(raw)) return uncertain(`Cannot prove read internal-URL path stays in workspace: ${raw}`);
 	const target = stripGrepSelector(raw);
 	// 1. Secret/env files are denied before any workspace/allowlist allow.
 	if (isSecretReadTarget(target, ctx.workspaceRoot))
 		return denySecret(`read targets a secret or environment file: ${target}`);
-	// 2. In-workspace (non-secret) and 3. session-allowed extra roots are allowed.
-	if (isWithinExtraRoot(target, ctx)) return ALLOW;
+	// 2. In-workspace (non-secret), 3. session-allowed extra roots, 4. config allow paths.
+	const pathPolicy = isAllowedTarget(target, ctx);
+	if (pathPolicy === "deny") return deny(`read target denied by paths policy: ${target}`);
+	if (pathPolicy === "allow") return ALLOW;
 	const reason = classifyReadPath(target, ctx.workspaceRoot);
 	// 4/5. A workspace escape with no allowlist match is unprovable -> escalate.
 	if (reason) return uncertain(`read ${reason}`);
@@ -363,7 +425,7 @@ function proveBashSafe(
 		if (isInternalUrlPath(rawCwdArg as string))
 			return uncertain(`Cannot prove bash internal-URL cwd stays in workspace: ${rawCwdArg}`);
 		const resolved = realpathOrSelf(resolveTargetPath(rawCwdArg as string, root));
-		if (!isPathInside(resolved, realRoot) && !isWithinExtraRoot(resolved, ctx)) {
+		if (!isPathInside(resolved, realRoot) && isAllowedTarget(resolved, ctx) !== "allow") {
 			return deny(`Refusing to run bash outside the workspace root: ${resolved}`);
 		}
 		effectiveCwd = resolved;
@@ -409,7 +471,7 @@ function proveBashSafe(
 			// escalates to the judge, so a punted `cd` is never weaker than a deny.
 			if (i === 0 && head === "cd" && isLiteralPath(target)) {
 				const resolved = realpathOrSelf(resolveTargetPath(target, root));
-				if (!isPathInside(resolved, realRoot) && !isWithinExtraRoot(resolved, ctx)) {
+				if (!isPathInside(resolved, realRoot) && isAllowedTarget(resolved, ctx) !== "allow") {
 					return deny(`Refusing to run bash outside the workspace root: ${resolved}`);
 				}
 				if (!hasExplicitCwd) effectiveCwd = resolved; // proven in-workspace relocation
