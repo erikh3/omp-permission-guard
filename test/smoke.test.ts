@@ -11,6 +11,7 @@ import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
 import { extractAllApprovalPaths } from "../src/approval-path";
 import { classifyReadPath, isSecretReadTarget, matchWorkspaceEscape } from "../src/risky-paths";
+import { parseSkillLoad } from "../src/path-utils";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -213,6 +214,101 @@ describe("classifyHeuristic (other tools)", () => {
 		expect(
 			classifyHeuristic("read", { path: "/tmp/allowed/x.txt" }, { ...rctx, extraRoots: ["/tmp/allowed"] }).decision,
 		).toBe("allow");
+	});
+	test("read allowed by an exact paths file entry -> allow", () => {
+		expect(
+			classifyHeuristic("read", { path: "/etc/hosts" }, { ...rctx, allowedPaths: { "/etc/hosts": "allow" } }).decision,
+		).toBe("allow");
+	});
+	test("read NOT matching a sibling paths entry -> uncertain (per-file, non-recursive)", () => {
+		expect(
+			classifyHeuristic("read", { path: "/etc/passwd" }, { ...rctx, allowedPaths: { "/etc/hosts": "allow" } }).decision,
+		).toBe("uncertain");
+	});
+	test("read allowed by a paths dir glob (/etc/*) -> allow", () => {
+		expect(
+			classifyHeuristic("read", { path: "/etc/hosts" }, { ...rctx, allowedPaths: { "/etc/*": "allow" } }).decision,
+		).toBe("allow");
+	});
+	test("read denied by an explicit paths deny entry -> deny", () => {
+		expect(
+			classifyHeuristic("read", { path: "/etc/hosts" }, { ...rctx, allowedPaths: { "/etc/hosts": "deny" } }).decision,
+		).toBe("deny");
+	});
+	test("paths deny short-circuits a broader allow glob", () => {
+		const v = classifyHeuristic("read", { path: "/etc/hosts" }, { ...rctx, allowedPaths: { "/etc/*": "allow", "/etc/hosts": "deny" } });
+		expect(v.decision).toBe("deny");
+	});
+	test("secret file still denied even when covered by a paths allow glob", () => {
+		const v = classifyHeuristic("read", { path: "/etc/ssl/private/.env" }, { ...rctx, allowedPaths: { "/etc/*": "allow" } });
+		expect(v.decision).toBe("deny");
+		expect(v.secret).toBe(true);
+	});
+	test("grep allowed by a paths dir glob -> allow", () => {
+		expect(
+			classifyHeuristic("grep", { pattern: "x", path: "/etc/*" }, { workspaceRoot: WS, tier: "read", allowedPaths: { "/etc/*": "allow" } }).decision,
+		).toBe("allow");
+	});
+	test("bash writing under a paths glob (/tmp/*) -> allow (covers the temp-dir case)", () => {
+		const dir = require("node:fs").mkdtempSync("/tmp/omp-guard-bash-");
+		try {
+			expect(
+				classifyHeuristic("bash", { command: `mkdir -p ${dir}/plan && touch ${dir}/plan/notes.md` }, { workspaceRoot: WS, tier: "exec", allowedPaths: { "/tmp/*": "allow" } }).decision,
+			).toBe("allow");
+		} finally {
+			require("node:fs").rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	// B1: non-string policy value must not throw (was TypeError: rawPolicy.trim is not a function)
+	test("B1 regression: non-string policy value in paths -> gracefully skipped, not a throw", () => {
+		expect(() =>
+			classifyHeuristic("read", { path: "/etc/hosts" }, { ...rctx, allowedPaths: { "/etc/*": 1 as unknown as string } }),
+		).not.toThrow();
+		// The invalid entry is skipped -> path not matched -> uncertain (escape)
+		expect(
+			classifyHeuristic("read", { path: "/etc/hosts" }, { ...rctx, allowedPaths: { "/etc/*": 1 as unknown as string } }).decision,
+		).toBe("uncertain");
+	});
+	// B2: paths deny must block write/edit tools, not just reads
+	test("B2 regression: paths deny on an in-workspace write target -> deny (not silently allowed)", () => {
+		expect(
+			classifyHeuristic("write", { path: "src/sensitive.ts" }, { workspaceRoot: WS, tier: "write", allowedPaths: { "src/sensitive.ts": "deny" } }).decision,
+		).toBe("deny");
+		expect(
+			classifyHeuristic("edit", { input: "[src/sensitive.ts#AAAA]\nPUT >1:\n+x" }, { workspaceRoot: WS, tier: "write", allowedPaths: { "src/sensitive.ts": "deny" } }).decision,
+		).toBe("deny");
+	});
+	// B3: classifyRiskyPath still runs for paths-allow writes; a symlink to a .env file (denylist hit
+	// that is NOT a workspace-escape reason) is blocked even with an allow glob. The macOS
+	// /private/etc alias gap in SYSTEM_ROOTS is pre-existing and out of scope.
+	test("B3 regression: paths-allow write does not bypass .env denylist hit via symlink", () => {
+		const osm = require("node:os");
+		const fsm = require("node:fs");
+		const pathm = require("node:path");
+		const linkDir = fsm.mkdtempSync(pathm.join(osm.tmpdir(), "omp-guard-symlink-"));
+		try {
+			// Create a .env file (denylist) and a symlink to it with a non-.env name inside the allowed dir
+			const realEnv = pathm.join(linkDir, ".env");
+			const linkPath = pathm.join(linkDir, "config-link");
+			fsm.writeFileSync(realEnv, "SECRET=123");
+			fsm.symlinkSync(realEnv, linkPath);
+			// classifyRiskyPath follows the symlink -> resolves to .env -> denylist hit (not just workspace-escape)
+			const v = classifyHeuristic("write", { path: linkPath }, { workspaceRoot: WS, tier: "write", allowedPaths: { [`${linkDir}/*`]: "allow" } });
+			expect(v.decision).toBe("deny");
+		} finally {
+			fsm.rmSync(linkDir, { recursive: true, force: true });
+		}
+	});
+	// C1: garbage/traversal skill URLs must not be tagged as skill loads
+	test("C1 regression: skill://.. traversal URL falls through to generic uncertain, not skill rail", () => {
+		const v = classifyHeuristic("read", { path: "skill://../etc/passwd" }, { ...rctx });
+		expect(v.decision).toBe("uncertain");
+		expect(v.skillLoad).toBeUndefined();
+	});
+	test("C1 regression: empty skill:// name falls through to uncertain, not skill rail", () => {
+		const v = classifyHeuristic("read", { path: "skill://" }, { ...rctx });
+		expect(v.decision).toBe("uncertain");
+		expect(v.skillLoad).toBeUndefined();
 	});
 	test("edit patch-mode rename escaping the workspace -> deny", () => {
 		const args = { path: "src/a.ts", edits: [{ op: "update", rename: "../../../../../../etc/evil.ts" }] };
@@ -926,5 +1022,107 @@ describe("isSecretReadTarget (.aws and .gnupg dir segments)", () => {
 	});
 	test("does not flag an ordinary src file as secret", () => {
 		expect(isSecretReadTarget("src/config.ts", WS)).toBe(false);
+	});
+});
+
+describe("parseSkillLoad", () => {
+	test("skill:// URL -> skill kind + name", () => {
+		expect(parseSkillLoad("skill://obsidian-markdown")).toEqual({ kind: "skill", name: "obsidian-markdown" });
+	});
+	test("rule:// URL -> rule kind + name", () => {
+		expect(parseSkillLoad("rule://ts-set-map")).toEqual({ kind: "rule", name: "ts-set-map" });
+	});
+	test("skill:// with a subpath keeps only the name segment", () => {
+		expect(parseSkillLoad("skill://graphify/SKILL.md")).toEqual({ kind: "skill", name: "graphify" });
+	});
+	test("skill:// with a selector strips it", () => {
+		expect(parseSkillLoad("skill://catch-up:1-20")).toEqual({ kind: "skill", name: "catch-up" });
+	});
+	test("non-skill internal URL -> undefined", () => {
+		expect(parseSkillLoad("ssh://host/etc")).toBeUndefined();
+	});
+	test("plain filesystem path -> undefined", () => {
+		expect(parseSkillLoad("src/index.ts")).toBeUndefined();
+	});
+});
+
+describe("classifyHeuristic (skill/rule loads)", () => {
+	const rctx = { workspaceRoot: WS, tier: "read" as const };
+	test("read skill:// -> uncertain, tagged skillLoad", () => {
+		const v = classifyHeuristic("read", { path: "skill://obsidian-markdown" }, rctx);
+		expect(v.decision).toBe("uncertain");
+		expect(v.skillLoad).toEqual({ kind: "skill", name: "obsidian-markdown" });
+	});
+	test("read rule:// -> tagged skillLoad", () => {
+		expect(classifyHeuristic("read", { path: "rule://ts-set-map" }, rctx).skillLoad).toEqual({
+			kind: "rule",
+			name: "ts-set-map",
+		});
+	});
+	test("other internal URLs (ssh://) carry no skillLoad tag", () => {
+		expect(classifyHeuristic("read", { path: "ssh://host/x" }, rctx).skillLoad).toBeUndefined();
+	});
+});
+
+describe("evaluatePermission (skill-load rail)", () => {
+	const base = { userPolicies: {}, workspaceRoot: WS } as const;
+	const skillArgs = { toolName: "read", args: { path: "skill://obsidian-markdown" }, tier: "read" as const } as const;
+
+	test("no rules + UI -> allow-leaning prompt naming the skill", async () => {
+		for (const mode of ["heuristic", "guardian", "hybrid"] as const) {
+			const a = await evaluatePermission({ ...skillArgs, mode, hasUI: true, ...base });
+			expect(a.action).toBe("prompt");
+			expect(a.action === "prompt" && a.recommend).toBe("allow");
+			expect(a.action === "prompt" && a.skillLoad?.name).toBe("obsidian-markdown");
+		}
+	});
+	test("exact-name allow rule -> allow (no prompt)", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "obsidian-markdown": "allow" }, ...base });
+		expect(a.action).toBe("allow");
+	});
+	test("wildcard '*' allow rule -> allow any skill", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "*": "allow" }, ...base });
+		expect(a.action).toBe("allow");
+	});
+	test("prefix glob 'obsidian-*' allow rule -> allow a matching skill", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "obsidian-*": "allow" }, ...base });
+		expect(a.action).toBe("allow");
+	});
+	test("prefix glob that does NOT match -> still prompts", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "work-*": "allow" }, ...base });
+		expect(a.action).toBe("prompt");
+	});
+	test("explicit deny rule -> deny (never prompts)", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "obsidian-markdown": "deny" }, ...base });
+		expect(a.action).toBe("deny");
+	});
+	test("deny match wins over an overlapping allow match", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "*": "allow", "obsidian-*": "deny" }, ...base });
+		expect(a.action).toBe("deny");
+	});
+	test("explicit prompt rule -> prompts (does not auto-allow)", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: true, skillLoadRules: { "*": "prompt" }, ...base });
+		expect(a.action).toBe("prompt");
+	});
+	test("headless (no UI) + no matching allow -> fail-safe deny", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: false, ...base });
+		expect(a.action).toBe("deny");
+	});
+	test("headless (no UI) + matching allow rule -> allow (no prompt needed)", async () => {
+		const a = await evaluatePermission({ ...skillArgs, mode: "hybrid", hasUI: false, skillLoadRules: { "obsidian-*": "allow" }, ...base });
+		expect(a.action).toBe("allow");
+	});
+	test("a real workspace escape (non-skill) is NOT diverted to the skill rail", async () => {
+		const a = await evaluatePermission({
+			toolName: "read",
+			args: { path: "ssh://host/etc/passwd" },
+			tier: "read",
+			mode: "heuristic",
+			hasUI: true,
+			promptOnBlock: true,
+			...base,
+		});
+		expect(a.action === "prompt" && a.skillLoad).toBeUndefined();
+		expect(a.action === "prompt" && a.recommend).toBe("deny");
 	});
 });
