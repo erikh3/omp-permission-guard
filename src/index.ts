@@ -262,20 +262,23 @@ interface ApprovalOutcome {
  *
  * Also surfaces the pause to herdr (a no-op outside a herdr pane): a
  * `herdr:blocked` bus event flips herdr's OMP lifecycle state to `blocked`, and
- * a display-only `summary` metadata token names what the pane is waiting on.
- * Both are cleared on every exit path (approve, deny, cancel, throw) via the
- * `finally` block.
+ * a display-only `summary` metadata token names what the pane is waiting on —
+ * tool name plus the compact `argsPreview` (target path, `pattern "…" in <path>`,
+ * or command), so herdr's sidebar/notch names the call even when its scraped
+ * dialog body is empty or truncated. Both are cleared on every exit path
+ * (approve, deny, cancel, throw) via the `finally` block.
  */
 async function withBlockedIndicator<T>(
 	ui: ExtensionUIContext,
 	toolName: string,
 	events: HerdrEventBus | undefined,
 	blockedLabel: string,
+	argsPreview: string,
 	run: () => Promise<T>,
 ): Promise<T> {
 	ui.setWorkingMessage?.(`Permission guard: waiting for you to approve ${toolName}`);
 	emitBlocked(events, true, blockedLabel);
-	reportBlockedMetadata(toolName);
+	reportBlockedMetadata(toolName, argsPreview);
 	try {
 		return await run();
 	} finally {
@@ -592,7 +595,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// via the `skill` policy map, not chosen here).
 		if (action.skillLoad) {
 			const skill = action.skillLoad;
-			const outcome = await withBlockedIndicator(ctx.ui, event.toolName, pi.events, reason, () =>
+			const outcome = await withBlockedIndicator(ctx.ui, event.toolName, pi.events, reason, `${skill.kind}://${skill.name}`, () =>
 				askSkillLoad(ctx.ui, skill),
 			);
 			if (outcome.decision === "allow") {
@@ -618,7 +621,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		// The dialog blocks indefinitely: the host pauses the 30s handler budget
 		// while a tool_call dialog is open, so it resolves only when the user
 		// answers or the turn is aborted (ESC / interrupt / shutdown).
-		const outcome = await withBlockedIndicator(ctx.ui, event.toolName, pi.events, reason, () =>
+		const outcome = await withBlockedIndicator(ctx.ui, event.toolName, pi.events, reason, argsPreview, () =>
 			askApproval(ctx.ui, reason, event.toolName, previewArgs(event.toolName, event.input), {
 				recommendDeny: action.recommend === "deny",
 				externalDir,

@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+	blockedSummary,
 	clearBlockedMetadata,
 	emitBlocked,
 	HERDR_BLOCKED_EVENT,
@@ -114,6 +115,16 @@ describe("metadataRequest env-gating", () => {
 		// A null token value is the documented "clear this token" signal.
 		expect(second.params.tokens).toEqual({ summary: null });
 		expect(second.params.seq).toBeGreaterThan(first.params.seq);
+	});
+
+	test("enriched summary token carries tool + detail so herdr names the awaited call", () => {
+		// blockedSummary composes what reportBlockedMetadata writes: the tool name
+		// plus the compact args preview, so the sidebar/notch names the call even
+		// when herdr's scraped dialog body is empty or truncated.
+		expect(blockedSummary("grep", 'pattern "foo" in src')).toBe('\u23f8 grep \u00b7 pattern "foo" in src');
+		// No detail (or blank) falls back to the tool name alone.
+		expect(blockedSummary("bash")).toBe("\u23f8 bash");
+		expect(blockedSummary("edit", "   ")).toBe("\u23f8 edit");
 	});
 });
 

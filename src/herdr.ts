@@ -135,11 +135,20 @@ function sendMetadata(tokens: Record<string, string | null>): void {
 /**
  * Set the display-only `summary` token to a compact "paused on you" marker.
  * Sidebar space is tight and truncates, so lead with the U+23F8 pause glyph and
- * the tool name only — the full reason and args are in the dialog itself, one
- * click away on the agent row.
+ * the tool name. When a `detail` is supplied (the same compact args preview the
+ * dialog shows — a target path, `pattern "…" in <path>`, or the command), append
+ * it after a middle dot so herdr names WHAT the pane is waiting on even when its
+ * scraped notch body comes back empty or truncated. herdr truncates the row to
+ * fit; the full reason and args are always in the dialog itself.
  */
-export function reportBlockedMetadata(toolName: string): void {
-	sendMetadata({ summary: `\u23f8 ${toolName}` });
+export function blockedSummary(toolName: string, detail?: string): string {
+	const trimmed = detail?.trim();
+	return trimmed ? `\u23f8 ${toolName} \u00b7 ${trimmed}` : `\u23f8 ${toolName}`;
+}
+
+/** Send the composed blocked `summary` token over the herdr socket (no-op outside a pane). */
+export function reportBlockedMetadata(toolName: string, detail?: string): void {
+	sendMetadata({ summary: blockedSummary(toolName, detail) });
 }
 
 /** Clear the `summary` token once the dialog resolves. */
