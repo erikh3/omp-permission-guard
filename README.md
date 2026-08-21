@@ -97,7 +97,7 @@ Which files are read: the active agent directory's `config.yml` (profile-aware �
 
 A skill is more than its `SKILL.md` guide: bundles ship supporting assets (`references/`, `scripts/`, …) the agent reads by **absolute filesystem path**, not via the `skill://` URL. Those reads land outside the workspace, so without special handling each one would hit the scary escape prompt. The guard recognizes a read whose path resolves **inside an installed skill's own directory** (`.../skills/<name>/…`, confirmed by that directory's `SKILL.md` manifest) and routes it through this same skill rail, keyed by the skill **name** — so a skill you have allow-listed loads its resources silently, and one you don't gets the same name-forward dialog its guide would. The manifest check is what keeps this safe: a path that merely *contains* a `skills/` segment is never diverted unless it resolves into a genuine skill root, and the secret-file gate still wins (a `.env`/key inside a skill dir is denied regardless).
 
-**A skill loaded once is trusted for the rest of the session:** when you allow a skill's guide or any of its resources, its name is remembered and every remaining resource of that skill auto-loads without re-prompting.
+**A skill trusted once is trusted for the rest of the session, regardless of how:** whether a skill is allowed by a config `skill` rule or by a one-off dialog "Allow", its name is remembered and every remaining resource of that skill (its `SKILL.md`, `references/`, `scripts/`) auto-loads without re-prompting. Config and dialog are symmetric trust sources.
 
 Instead, the glob-keyed `skill` policy map decides which docs auto-load (matched against the doc **name**, `*`/`?` wildcards supported):
 

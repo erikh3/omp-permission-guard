@@ -29,7 +29,8 @@ import { type ApprovalPolicy, getToolTier, normalizePolicy } from "./tier";
 type Mode = GuardMode | "off";
 const MODES: Record<string, true> = { off: true, heuristic: true, guardian: true, hybrid: true };
 const DEFAULT_MODE: Mode = "hybrid";
-const CONFIG_PATH = path.join(resolveAgentDir(), "permission-guard.json");
+/** Resolve the guard's config path fresh each call so profile/env changes (and tests) are honored. */
+const configPath = (): string => path.join(resolveAgentDir(), "permission-guard.json");
 
 interface GuardConfig {
 	mode?: Mode;
@@ -68,7 +69,7 @@ function isMode(value: unknown): value is Mode {
 
 function loadConfig(logger?: { debug?: (...a: unknown[]) => void }): GuardConfig {
 	try {
-		const raw = fs.readFileSync(CONFIG_PATH, "utf8");
+		const raw = fs.readFileSync(configPath(), "utf8");
 		const parsed = JSON.parse(raw) as GuardConfig;
 		return parsed && typeof parsed === "object" ? parsed : {};
 	} catch (err) {
@@ -435,7 +436,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 
 			if (raw === "" || sub === "status") {
 				ctx.ui.notify(
-					`Permission guard mode: ${resolveMode()} · ${sessionAllow.size} session-allowed call(s) (config: ${CONFIG_PATH})`,
+					`Permission guard mode: ${resolveMode()} · ${sessionAllow.size} session-allowed call(s) (config: ${configPath()})`,
 					"info",
 				);
 				return;
@@ -581,6 +582,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 		});
 
 		if (action.action === "allow") {
+			// A config-allowed skill load is a trust source too: remember it so this skill's remaining
+			// resources auto-allow for the session, symmetric with a dialog allow (below).
+			if (action.loadedSkill) loadedSkills.add(action.loadedSkill);
 			log("allow", { via: "classifier" });
 			return;
 		}

@@ -1187,6 +1187,9 @@ describe("parseSkillResourcePath (filesystem skill-resource reads)", () => {
 			skillLoadRules: { "add-to-work-obsidian": "allow" },
 		});
 		expect(a.action).toBe("allow");
+		// A config `allow` reports the skill name so the caller can trust its remaining resources
+		// this session, symmetric with a dialog allow.
+		expect(a.action === "allow" && a.loadedSkill).toBe("add-to-work-obsidian");
 	});
 	test("a session-loaded skill's resource read -> allow without a rule (loadedSkills)", async () => {
 		const a = await evaluatePermission({

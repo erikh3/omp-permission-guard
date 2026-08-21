@@ -14,7 +14,7 @@ import { normalizePolicy, type ToolTier } from "./tier";
 export type GuardMode = "heuristic" | "guardian" | "hybrid";
 
 export type PermissionAction =
-	| { action: "allow" }
+	| { action: "allow"; loadedSkill?: string }
 	| { action: "deny"; reason: string }
 	| { action: "prompt"; reason?: string; recommend?: "allow" | "deny"; judged?: boolean; confidence?: number; guardianError?: boolean; skillLoad?: { kind: "skill" | "rule"; name: string } };
 
@@ -147,11 +147,14 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		// fail-safe deny). It never rides the generic (scary, escape-framed) internal-URL prompt.
 		if (rv.skillLoad) {
 			const { kind, name } = rv.skillLoad;
-			// A skill already loaded this session needs no further checks — its resources
-			// (references, scripts, SKILL.md) auto-allow. A `deny` policy still wins below.
+			// A skill already trusted this session (loaded via config OR a prior dialog allow) needs no
+			// further checks — its resources (references, scripts, SKILL.md) auto-allow. A `deny` wins.
 			const policy = resolveSkillPolicy(name, skillLoadRules);
 			if (policy === "deny") return { action: "deny", reason: `Blocked ${kind} load "${name}" by skill policy.` };
-			if (policy === "allow" || loadedSkills?.has(name)) return { action: "allow" };
+			if (loadedSkills?.has(name)) return { action: "allow" };
+			// A config `allow` is a first-class trust source: record it (via `loadedSkill`) so every
+			// later resource of this skill is trusted uniformly, exactly like a dialog allow.
+			if (policy === "allow") return { action: "allow", loadedSkill: name };
 			const reason = rv.reason ?? `Load ${kind} "${name}" into context`;
 			if (!hasUI) return { action: "deny", reason: `${reason} — no skill allow rule and no UI to confirm.` };
 			return { action: "prompt", reason, recommend: "allow", skillLoad: rv.skillLoad };
