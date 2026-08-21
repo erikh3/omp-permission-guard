@@ -59,6 +59,14 @@ export interface EvaluatePermissionInput {
 	 * both escalate to the name-forward dialog). From config `skill`.
 	 */
 	skillLoadRules?: Record<string, "allow" | "deny">;
+	/**
+	 * Skill names the user allowed to load THIS session (via the skill-load dialog). A skill/rule
+	 * load or resource read for a name in this set auto-allows without re-prompting — the "a loaded
+	 * skill's resources need no further checks" rule. Config-allow-listed skills get this for free
+	 * (their resources carry the same name and match the same glob), so this covers only the dynamic
+	 * user-approved case. The caller owns the set and adds to it when a skill-load prompt is allowed.
+	 */
+	loadedSkills?: ReadonlySet<string>;
 }
 
 const EXEC_TIER: ToolTier = "exec";
@@ -123,6 +131,7 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		sessionRoots,
 		allowedPaths,
 		skillLoadRules,
+		loadedSkills,
 	} = input;
 
 	const userPolicy = Object.hasOwn(userPolicies, toolName) ? normalizePolicy(userPolicies[toolName]) : undefined;
@@ -138,10 +147,12 @@ export async function evaluatePermission(input: EvaluatePermissionInput): Promis
 		// fail-safe deny). It never rides the generic (scary, escape-framed) internal-URL prompt.
 		if (rv.skillLoad) {
 			const { kind, name } = rv.skillLoad;
+			// A skill already loaded this session needs no further checks — its resources
+			// (references, scripts, SKILL.md) auto-allow. A `deny` policy still wins below.
 			const policy = resolveSkillPolicy(name, skillLoadRules);
-			if (policy === "allow") return { action: "allow" };
-			const reason = rv.reason ?? `Load ${kind} "${name}" into context`;
 			if (policy === "deny") return { action: "deny", reason: `Blocked ${kind} load "${name}" by skill policy.` };
+			if (policy === "allow" || loadedSkills?.has(name)) return { action: "allow" };
+			const reason = rv.reason ?? `Load ${kind} "${name}" into context`;
 			if (!hasUI) return { action: "deny", reason: `${reason} — no skill allow rule and no UI to confirm.` };
 			return { action: "prompt", reason, recommend: "allow", skillLoad: rv.skillLoad };
 		}

@@ -544,6 +544,46 @@ describe("tool_call hook wiring", () => {
 		expect(res?.reason).toContain("obsidian-markdown");
 	});
 
+	test("filesystem skill-resource read: prompts allow-first, then remembers the skill so later resources auto-allow", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		// A real installed-skill layout OUTSIDE the workspace, with a name no user config rule matches.
+		const skillRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-skillfs-"));
+		const skillDir = path.join(skillRoot, "skills", "zz-e2e-fixture-skill");
+		fs.mkdirSync(path.join(skillDir, "references"), { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "# skill");
+		fs.writeFileSync(path.join(skillDir, "references", "a.md"), "# a");
+		fs.writeFileSync(path.join(skillDir, "references", "b.md"), "# b");
+		try {
+			let title = "";
+			let options: string[] = [];
+			const capCtx = {
+				...ctx,
+				ui: {
+					notify: (m: string) => notes.push(m),
+					input: async () => undefined,
+					select: async (t: string, o: string[]) => {
+						title = t;
+						options = o;
+						return o.find(x => x === "Allow");
+					},
+				},
+			};
+			const { handler } = harness();
+			// First resource read: no config rule -> name-forward, allow-first prompt.
+			const first = await handler({ toolName: "read", input: { path: path.join(skillDir, "references", "a.md") } }, capCtx);
+			expect(first).toBeUndefined();
+			expect(title).toContain("zz-e2e-fixture-skill");
+			expect(options[0]).toBe("Allow");
+			// Second resource read of the SAME skill: auto-allowed, no prompt (loadedSkills).
+			title = "";
+			const second = await handler({ toolName: "read", input: { path: path.join(skillDir, "references", "b.md") } }, capCtx);
+			expect(second).toBeUndefined();
+			expect(title).toBe("");
+		} finally {
+			fs.rmSync(skillRoot, { recursive: true, force: true });
+		}
+	});
+
 	test("a read of an out-of-workspace dir allowed via omp /add-dir is not gated", async () => {
 		process.env.OMP_GUARD_MODE = "heuristic";
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-roots-"));

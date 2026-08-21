@@ -387,6 +387,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 	const sessionAllow = new Map<string, { label: string; seq: number }>();
 	let allowSeq = 0;
 	const sessionAllowedRoots = new Set<string>();
+	// Skill names the user allowed to load this session (via the skill-load dialog). Once a skill is
+	// loaded, its resources (references, scripts, SKILL.md) auto-allow without re-prompting.
+	const loadedSkills = new Set<string>();
 
 	pi.setLabel("Permission Guard");
 
@@ -574,6 +577,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			allowedPaths: cfg.paths,
 			// Glob-keyed skill/rule auto-load policy (same shape as `approval`); invalid values dropped.
 			skillLoadRules: normalizeSkillLoadRules(cfg.skill),
+			loadedSkills,
 		});
 
 		if (action.action === "allow") {
@@ -599,6 +603,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				askSkillLoad(ctx.ui, skill),
 			);
 			if (outcome.decision === "allow") {
+				// Remember the skill so its remaining resources (references, scripts, SKILL.md)
+				// auto-allow for the rest of the session without re-prompting.
+				loadedSkills.add(skill.name);
 				log("allow", { via: "prompt", choice: "skill-load-once", skill: skill.name });
 				return;
 			}
