@@ -90,6 +90,44 @@ export function parseSkillLoad(filePath: string): { kind: "skill" | "rule"; name
 	return { kind, name };
 }
 
+
+/**
+ * When `filePath` is a plain filesystem path pointing at a file inside an installed skill's
+ * directory (`.../skills/<name>/...`, where `<name>/SKILL.md` exists on disk), return
+ * `{ kind: "skill", name }`; otherwise `undefined`.
+ *
+ * Skill bundles ship their guide and helper assets (`references/`, `scripts/`, `SKILL.md`, ...)
+ * as ordinary files the agent reads by absolute path — NOT via the `skill://` URL scheme — so
+ * those reads would otherwise be misread as a workspace escape and hit the generic (scary)
+ * escape prompt. Recognizing them lets them ride the skill-load rail (governed by the `skill`
+ * policy map plus the session's already-loaded skills) instead.
+ *
+ * The `<name>/SKILL.md` existence check is what makes this safe: an arbitrary path merely
+ * containing a `skills/` segment is NOT tagged unless it resolves into a real skill root, so
+ * this cannot launder an arbitrary-filesystem read through the skill rail. The caller still
+ * applies the secret-file gate at higher priority, so a secret inside a skill dir is denied.
+ */
+export function parseSkillResourcePath(filePath: string, workspaceRoot: string): { kind: "skill"; name: string } | undefined {
+	const trimmed = filePath.trim();
+	if (!trimmed || isInternalUrlPath(trimmed)) return undefined;
+	const expanded = expandTilde(trimmed);
+	const resolved = path.normalize(path.isAbsolute(expanded) ? expanded : path.resolve(workspaceRoot, expanded));
+	const segments = resolved.split(path.sep);
+	// Walk from the deepest `skills/<name>` pairing outward; the nearest genuine skill root wins.
+	for (let i = segments.length - 2; i >= 1; i--) {
+		if (segments[i] !== "skills") continue;
+		const name = segments[i + 1];
+		if (!name || name === "." || name === "..") continue;
+		const skillDir = segments.slice(0, i + 2).join(path.sep);
+		try {
+			if (fs.statSync(path.join(skillDir, "SKILL.md")).isFile()) return { kind: "skill", name };
+		} catch {
+			// Not a real skill root (no manifest / unreadable) — keep scanning outward.
+		}
+	}
+	return undefined;
+}
+
 /** Best-effort realpath; returns the input unchanged when the path does not exist or errors. */
 function realpathOrSelf(p: string): string {
 	try {

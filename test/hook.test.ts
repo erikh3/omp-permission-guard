@@ -84,11 +84,18 @@ function selectUi(
 const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
+// A per-test empty agent dir so `resolveAgentDir()` -> `configPath()` reads NO real user config.
+// Tests that need a config write their own `permission-guard.json` into this dir and re-point
+// `PI_CODING_AGENT_DIR` themselves; the default here is deliberately empty (config = {}).
+let tmpAgentDir: string;
+
 beforeEach(() => {
 	for (const k of ENV_KEYS) {
 		savedEnv[k] = process.env[k];
 		delete process.env[k];
 	}
+	tmpAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-agentdir-"));
+	process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
 });
 
 afterEach(() => {
@@ -99,6 +106,7 @@ afterEach(() => {
 		if (savedEnv[k] === undefined) delete process.env[k];
 		else process.env[k] = savedEnv[k];
 	}
+	fs.rmSync(tmpAgentDir, { recursive: true, force: true });
 });
 
 describe("tool_call hook wiring", () => {
@@ -542,6 +550,75 @@ describe("tool_call hook wiring", () => {
 		const res = await handler({ toolName: "read", input: { path: "skill://obsidian-markdown" } }, denyCtx);
 		expect(res?.block).toBe(true);
 		expect(res?.reason).toContain("obsidian-markdown");
+	});
+
+	test("filesystem skill-resource read: prompts allow-first, then remembers the skill so later resources auto-allow", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		// A real installed-skill layout OUTSIDE the workspace, with a name no user config rule matches.
+		const skillRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-skillfs-"));
+		const skillDir = path.join(skillRoot, "skills", "zz-e2e-fixture-skill");
+		fs.mkdirSync(path.join(skillDir, "references"), { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "# skill");
+		fs.writeFileSync(path.join(skillDir, "references", "a.md"), "# a");
+		fs.writeFileSync(path.join(skillDir, "references", "b.md"), "# b");
+		try {
+			let title = "";
+			let options: string[] = [];
+			const capCtx = {
+				...ctx,
+				ui: {
+					notify: (m: string) => notes.push(m),
+					input: async () => undefined,
+					select: async (t: string, o: string[]) => {
+						title = t;
+						options = o;
+						return o.find(x => x === "Allow");
+					},
+				},
+			};
+			const { handler } = harness();
+			// First resource read: no config rule -> name-forward, allow-first prompt.
+			const first = await handler({ toolName: "read", input: { path: path.join(skillDir, "references", "a.md") } }, capCtx);
+			expect(first).toBeUndefined();
+			expect(title).toContain("zz-e2e-fixture-skill");
+			expect(options[0]).toBe("Allow");
+			// Second resource read of the SAME skill: auto-allowed, no prompt (loadedSkills).
+			title = "";
+			const second = await handler({ toolName: "read", input: { path: path.join(skillDir, "references", "b.md") } }, capCtx);
+			expect(second).toBeUndefined();
+			expect(title).toBe("");
+		} finally {
+			fs.rmSync(skillRoot, { recursive: true, force: true });
+		}
+	});
+
+	test("config-allowed skill: its filesystem resources load silently (no prompt), via config `skill` map", async () => {
+		process.env.OMP_GUARD_MODE = "heuristic";
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-cfgskill-"));
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const skillRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-guard-cfgskillfs-"));
+		const skillDir = path.join(skillRoot, "skills", "zz-cfg-fixture-skill");
+		fs.mkdirSync(path.join(skillDir, "references"), { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "# skill");
+		fs.writeFileSync(path.join(skillDir, "references", "a.md"), "# a");
+		try {
+			fs.writeFileSync(
+				path.join(agentDir, "permission-guard.json"),
+				JSON.stringify({ mode: "heuristic", skill: { "zz-cfg-fixture-skill": "allow" } }),
+			);
+			let prompted = false;
+			const spyCtx = {
+				...ctx,
+				ui: { notify: (m: string) => notes.push(m), input: async () => undefined, select: async () => { prompted = true; return undefined; } },
+			};
+			const { handler } = harness();
+			const res = await handler({ toolName: "read", input: { path: path.join(skillDir, "references", "a.md") } }, spyCtx);
+			expect(res).toBeUndefined();
+			expect(prompted).toBe(false);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+			fs.rmSync(skillRoot, { recursive: true, force: true });
+		}
 	});
 
 	test("a read of an out-of-workspace dir allowed via omp /add-dir is not gated", async () => {

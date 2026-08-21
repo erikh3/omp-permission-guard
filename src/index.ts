@@ -29,7 +29,8 @@ import { type ApprovalPolicy, getToolTier, normalizePolicy } from "./tier";
 type Mode = GuardMode | "off";
 const MODES: Record<string, true> = { off: true, heuristic: true, guardian: true, hybrid: true };
 const DEFAULT_MODE: Mode = "hybrid";
-const CONFIG_PATH = path.join(resolveAgentDir(), "permission-guard.json");
+/** Resolve the guard's config path fresh each call so profile/env changes (and tests) are honored. */
+const configPath = (): string => path.join(resolveAgentDir(), "permission-guard.json");
 
 interface GuardConfig {
 	mode?: Mode;
@@ -68,7 +69,7 @@ function isMode(value: unknown): value is Mode {
 
 function loadConfig(logger?: { debug?: (...a: unknown[]) => void }): GuardConfig {
 	try {
-		const raw = fs.readFileSync(CONFIG_PATH, "utf8");
+		const raw = fs.readFileSync(configPath(), "utf8");
 		const parsed = JSON.parse(raw) as GuardConfig;
 		return parsed && typeof parsed === "object" ? parsed : {};
 	} catch (err) {
@@ -387,6 +388,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 	const sessionAllow = new Map<string, { label: string; seq: number }>();
 	let allowSeq = 0;
 	const sessionAllowedRoots = new Set<string>();
+	// Skill names the user allowed to load this session (via the skill-load dialog). Once a skill is
+	// loaded, its resources (references, scripts, SKILL.md) auto-allow without re-prompting.
+	const loadedSkills = new Set<string>();
 
 	pi.setLabel("Permission Guard");
 
@@ -432,7 +436,7 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 
 			if (raw === "" || sub === "status") {
 				ctx.ui.notify(
-					`Permission guard mode: ${resolveMode()} · ${sessionAllow.size} session-allowed call(s) (config: ${CONFIG_PATH})`,
+					`Permission guard mode: ${resolveMode()} · ${sessionAllow.size} session-allowed call(s) (config: ${configPath()})`,
 					"info",
 				);
 				return;
@@ -574,9 +578,13 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 			allowedPaths: cfg.paths,
 			// Glob-keyed skill/rule auto-load policy (same shape as `approval`); invalid values dropped.
 			skillLoadRules: normalizeSkillLoadRules(cfg.skill),
+			loadedSkills,
 		});
 
 		if (action.action === "allow") {
+			// A config-allowed skill load is a trust source too: remember it so this skill's remaining
+			// resources auto-allow for the session, symmetric with a dialog allow (below).
+			if (action.loadedSkill) loadedSkills.add(action.loadedSkill);
 			log("allow", { via: "classifier" });
 			return;
 		}
@@ -599,6 +607,9 @@ export default function permissionGuard(pi: ExtensionAPI): void {
 				askSkillLoad(ctx.ui, skill),
 			);
 			if (outcome.decision === "allow") {
+				// Remember the skill so its remaining resources (references, scripts, SKILL.md)
+				// auto-allow for the rest of the session without re-prompting.
+				loadedSkills.add(skill.name);
 				log("allow", { via: "prompt", choice: "skill-load-once", skill: skill.name });
 				return;
 			}

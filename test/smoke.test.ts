@@ -11,7 +11,7 @@ import { analyzeBashCommand } from "../src/safety-net/index";
 import { getToolTier } from "../src/tier";
 import { extractAllApprovalPaths } from "../src/approval-path";
 import { classifyReadPath, isSecretReadTarget, matchWorkspaceEscape } from "../src/risky-paths";
-import { parseSkillLoad } from "../src/path-utils";
+import { parseSkillLoad, parseSkillResourcePath } from "../src/path-utils";
 
 const WS = process.cwd();
 const ctx = { workspaceRoot: WS, tier: "exec" as const };
@@ -1124,5 +1124,91 @@ describe("evaluatePermission (skill-load rail)", () => {
 		});
 		expect(a.action === "prompt" && a.skillLoad).toBeUndefined();
 		expect(a.action === "prompt" && a.recommend).toBe("deny");
+	});
+});
+
+describe("parseSkillResourcePath (filesystem skill-resource reads)", () => {
+	const osm = require("node:os");
+	const fsm = require("node:fs");
+	const pathm = require("node:path");
+	// A realistic installed-skill layout OUTSIDE the workspace: <root>/skills/<name>/{SKILL.md,references/*}
+	const root = fsm.mkdtempSync(pathm.join(osm.tmpdir(), "omp-guard-skill-"));
+	const skillDir = pathm.join(root, "skills", "add-to-work-obsidian");
+	fsm.mkdirSync(pathm.join(skillDir, "references"), { recursive: true });
+	fsm.writeFileSync(pathm.join(skillDir, "SKILL.md"), "# skill");
+	fsm.writeFileSync(pathm.join(skillDir, "references", "formatting.md"), "# ref");
+	// A directory that merely contains a `skills/<name>` segment but no SKILL.md manifest.
+	const fakeDir = pathm.join(root, "not-real", "skills", "spoof");
+	fsm.mkdirSync(fakeDir, { recursive: true });
+	fsm.writeFileSync(pathm.join(fakeDir, "notes.md"), "x");
+
+	test("a reference file inside a real skill dir -> tagged with the skill name", () => {
+		expect(parseSkillResourcePath(pathm.join(skillDir, "references", "formatting.md"), WS)).toEqual({
+			kind: "skill",
+			name: "add-to-work-obsidian",
+		});
+	});
+	test("the SKILL.md manifest itself -> tagged", () => {
+		expect(parseSkillResourcePath(pathm.join(skillDir, "SKILL.md"), WS)).toEqual({ kind: "skill", name: "add-to-work-obsidian" });
+	});
+	test("a `skills/<name>` path with NO SKILL.md manifest -> undefined (not a real skill root)", () => {
+		expect(parseSkillResourcePath(pathm.join(fakeDir, "notes.md"), WS)).toBeUndefined();
+	});
+	test("an ordinary out-of-workspace file -> undefined", () => {
+		expect(parseSkillResourcePath(pathm.join(root, "elsewhere.md"), WS)).toBeUndefined();
+	});
+	test("an internal-URL path -> undefined (handled by the skill:// rail, not this one)", () => {
+		expect(parseSkillResourcePath("skill://graphify", WS)).toBeUndefined();
+	});
+
+	test("classifyHeuristic read of a skill reference file -> uncertain, tagged skillLoad (rides the rail)", () => {
+		const v = classifyHeuristic("read", { path: pathm.join(skillDir, "references", "formatting.md") }, { workspaceRoot: WS, tier: "read" });
+		expect(v.decision).toBe("uncertain");
+		expect(v.skillLoad).toEqual({ kind: "skill", name: "add-to-work-obsidian" });
+	});
+	test("classifyHeuristic read of a skill ref with a line selector -> still tagged", () => {
+		const v = classifyHeuristic("read", { path: `${pathm.join(skillDir, "references", "formatting.md")}:1-5` }, { workspaceRoot: WS, tier: "read" });
+		expect(v.skillLoad).toEqual({ kind: "skill", name: "add-to-work-obsidian" });
+	});
+	test("a fake skill dir read is NOT diverted to the rail (stays a generic escape)", () => {
+		const v = classifyHeuristic("read", { path: pathm.join(fakeDir, "notes.md") }, { workspaceRoot: WS, tier: "read" });
+		expect(v.decision).toBe("uncertain");
+		expect(v.skillLoad).toBeUndefined();
+	});
+	test("an allow-listed skill's resource read -> allow (no prompt), via evaluatePermission", async () => {
+		const a = await evaluatePermission({
+			toolName: "read",
+			args: { path: pathm.join(skillDir, "references", "formatting.md") },
+			tier: "read",
+			mode: "hybrid",
+			hasUI: true,
+			userPolicies: {},
+			workspaceRoot: WS,
+			skillLoadRules: { "add-to-work-obsidian": "allow" },
+		});
+		expect(a.action).toBe("allow");
+		// A config `allow` reports the skill name so the caller can trust its remaining resources
+		// this session, symmetric with a dialog allow.
+		expect(a.action === "allow" && a.loadedSkill).toBe("add-to-work-obsidian");
+	});
+	test("a session-loaded skill's resource read -> allow without a rule (loadedSkills)", async () => {
+		const a = await evaluatePermission({
+			toolName: "read",
+			args: { path: pathm.join(skillDir, "references", "formatting.md") },
+			tier: "read",
+			mode: "hybrid",
+			hasUI: true,
+			userPolicies: {},
+			workspaceRoot: WS,
+			loadedSkills: new Set(["add-to-work-obsidian"]),
+		});
+		expect(a.action).toBe("allow");
+	});
+	test("a secret file inside a skill dir is still DENIED (secret gate wins over the rail)", () => {
+		const secretPath = pathm.join(skillDir, ".env");
+		fsm.writeFileSync(secretPath, "TOKEN=1");
+		const v = classifyHeuristic("read", { path: secretPath }, { workspaceRoot: WS, tier: "read" });
+		expect(v.decision).toBe("deny");
+		expect(v.secret).toBe(true);
 	});
 });

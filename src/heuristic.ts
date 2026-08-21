@@ -2,7 +2,7 @@ import { extractAllApprovalPaths } from "./approval-path";
 import type { ToolTier } from "./tier";
 import { extractLeadingCd } from "./bash-cwd";
 import { matchCriticalBashPattern } from "./critical-bash-patterns";
-import { isInternalUrlPath, isSessionLocalInternalUrl, parseSkillLoad, resolvePathPolicy } from "./path-utils";
+import { isInternalUrlPath, isSessionLocalInternalUrl, parseSkillLoad, parseSkillResourcePath, resolvePathPolicy } from "./path-utils";
 import { classifyReadPath, classifyRiskyPath, isDirectoryTarget, isPathInside, isSecretReadTarget, realpathOrSelf, resolveTargetPath, WORKSPACE_ESCAPE_MARKER } from "./risky-paths";
 import { analyzeBashCommand, containsDangerousCode } from "./safety-net/index";
 
@@ -343,8 +343,16 @@ function classifyFileRead(record: Record<string, unknown>, ctx: HeuristicContext
 	if (pathPolicy === "deny") return deny(`read target denied by paths policy: ${target}`);
 	if (pathPolicy === "allow") return ALLOW;
 	const reason = classifyReadPath(target, ctx.workspaceRoot);
-	// 4/5. A workspace escape with no allowlist match is unprovable -> escalate.
-	if (reason) return uncertain(`read ${reason}`);
+	// 5. A workspace escape into an installed skill's own directory (its `references/`, `scripts/`,
+	//    `SKILL.md`, ...) is a skill-resource load, not an arbitrary exfiltration — route it to the
+	//    skill-load rail (governed by the `skill` policy + the session's already-loaded skills)
+	//    instead of the generic escape prompt. The secret gate above still wins over this.
+	if (reason) {
+		const resource = parseSkillResourcePath(target, ctx.workspaceRoot);
+		if (resource) return skillLoadVerdict(`Load resource of skill "${resource.name}" into context`, resource);
+		// 6. Otherwise the read escapes the workspace with no allow -> unprovable, escalate.
+		return uncertain(`read ${reason}`);
+	}
 	return ALLOW;
 }
 
